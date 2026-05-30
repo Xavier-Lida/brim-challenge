@@ -75,10 +75,10 @@ Pipeline batch autonome (pandas + LangChain · Gemini, défaut `gemini-2.5-flash
 **Étapes**
 
 1. **MCC → spend category Brim.** `mcc_codes.csv` + overrides explicites + règles par mots-clés sur la description + plage `3000–3999` → `Voyage`, fallback `Autre`.
-2. **Groupement en événements.** Par employé : tri par date, nouveau cluster dès qu'un écart dépasse `GROUP_GAP_DAYS = 4` jours (clustering *déterministe*). Le LLM ne fait que **nommer** les clusters multi-transactions (titre + raison, batché). Chaque cluster reçoit un `event_group_id` (uuid).
+2. **Groupement en événements (spatiotemporel).** Par employé : tri par date, nouveau cluster dès qu'un écart dépasse `GROUP_GAP_DAYS = 4` jours — mais si les deux transactions sont au **même endroit** (même ville, ou coordonnées GPS à moins de `GEO_SAME_KM = 50` km), on tolère `SAME_PLACE_GAP_BONUS = 3` jours de plus. Ainsi un voyage (ex. la conférence à San Diego) reste groupé malgré un week-end, sans fusionner des événements distincts. Clustering *déterministe* ; le LLM ne fait que **nommer** les clusters multi-transactions (titre + raison, batché). Chaque cluster reçoit un `event_group_id` (uuid).
 3. **Contexte politique.** Jointure des `transaction_flags` (message + `weight`) et agrégation des `employee_strikes` (count, total fraudé, descriptions).
 4. **Un `expense_report` par événement** : titre, `date_from`/`date_to`, `total_amount`, répartition par catégorie, `status = ready_for_approval`.
-5. **Recommandation d'approbation IA** (`approve` / `review` / `deny`) pour le CFO, raisonnant sur les flags + l'historique de strikes. Auto-approbation des rapports triviaux (1 item ≤ 100 CAD, sans flag ni strike) ; le reste est jugé par Gemini, avec un **fallback déterministe** (poids max ≥ 0.66 ou ≥ 2 strikes → `deny` ; flag présent ou montant > 500 → `review` ; sinon `approve`).
+5. **Recommandation d'approbation IA** (`approve` / `review` / `deny`) pour le CFO, raisonnant sur les flags + l'historique de strikes. Auto-approbation des rapports triviaux (1 item ≤ 100 CAD, sans flag ni strike) ; le reste est jugé par Gemini (par lots de `RECO_BATCH_SIZE = 40`), avec un **fallback déterministe** (poids max ≥ 0.66 ou ≥ 2 strikes → `deny` ; flag présent ou montant > 500 → `review` ; sinon `approve`).
 6. **Tolérance aux pannes** : toute erreur LLM dégrade vers le chemin déterministe/mock — jamais d'échec dur.
 
 ```
