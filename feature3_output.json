@@ -1,0 +1,49 @@
+{
+  "feature": "3 - Approval Notifications & Decision Engine",
+  "model": "mock",
+  "transaction_count": 2,
+  "approval_request_count": 1,
+  "notification_count": 2,
+  "approval_requests": [
+    {
+      "id": "303ae310-aabb-5590-97d0-45802731a429",
+      "transaction_id": "tx-001",
+      "employee_id": "emp-sarah",
+      "amount": 1200.0,
+      "reason": "Montant eleve pour une inscription conference.",
+      "ai_recommendation": "review",
+      "ai_reasoning": "Sarah Chen demande $1,200.00 CAD; Marketing a $9,954.50 CAD restant en Q2 2026; 0 dépense(s) similaire(s) cette année. À revoir — 1 avertissement(s) de conformité (poids max 3).",
+      "status": "pending",
+      "approver_id": null,
+      "decided_at": null
+    }
+  ],
+  "notifications": [
+    {
+      "id": "21c0e545-797b-5975-8f82-a9e61a588f6a",
+      "type": "flag",
+      "reference_id": "tx-001",
+      "message": "Transaction signalée ($1,200.00 CAD) : Montant eleve pour une inscription conference.",
+      "read": false,
+      "created_at": "2026-05-30T23:48:33+00:00"
+    },
+    {
+      "id": "c3fc44a2-b3b2-5aab-b2af-831b9d3ebf32",
+      "type": "approval",
+      "reference_id": "303ae310-aabb-5590-97d0-45802731a429",
+      "message": "Approbation requise : Sarah Chen — $1,200.00 CAD (reco : review)",
+      "read": false,
+      "created_at": "2026-05-30T23:48:33+00:00"
+    }
+  ],
+  "approver_emails": [
+    {
+      "approval_request_id": "303ae310-aabb-5590-97d0-45802731a429",
+      "to": "approver@company.com",
+      "subject": "[Approbation requise] Sarah Chen — $1,200.00 CAD (REVIEW)",
+      "text": "Sarah Chen (Marketing) demande $1,200.00 CAD.\nMotif : Montant eleve pour une inscription conference.\nBudget Q2 2026 : $9,954.50 CAD restant.\nRecommandation IA : REVIEW — Sarah Chen demande $1,200.00 CAD; Marketing a $9,954.50 CAD restant en Q2 2026; 0 dépense(s) similaire(s) cette année. À revoir — 1 avertissement(s) de conformité (poids max 3).\n\nDécider : http://localhost:3000/approvals/303ae310-aabb-5590-97d0-45802731a429\n",
+      "html": "<div style=\"font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:560px\"><h2 style=\"margin:0 0 8px\">Approbation requise</h2><p style=\"margin:0 0 4px\"><strong>Sarah Chen</strong> (Marketing) demande <strong>$1,200.00 CAD</strong>.</p><p style=\"margin:0 0 4px;color:#555\">Motif : Montant eleve pour une inscription conference.</p><p style=\"margin:0 0 4px;color:#555\">Budget Q2 2026 : $9,954.50 CAD restant.</p><p style=\"margin:8px 0\"><strong>Recommandation IA : REVIEW</strong><br><span style=\"color:#555\">Sarah Chen demande $1,200.00 CAD; Marketing a $9,954.50 CAD restant en Q2 2026; 0 dépense(s) similaire(s) cette année. À revoir — 1 avertissement(s) de conformité (poids max 3).</span></p><p><a href=\"http://localhost:3000/approvals/303ae310-aabb-5590-97d0-45802731a429\" style=\"display:inline-block;padding:10px 16px;background:#111;color:#fff;border-radius:8px;text-decoration:none\">Voir &amp; décider</a></p></div>",
+      "deep_link": "http://localhost:3000/approvals/303ae310-aabb-5590-97d0-45802731a429"
+    }
+  ]
+}

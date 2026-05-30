@@ -105,7 +105,7 @@ CREATE TABLE expense_reports (
 
 CREATE TABLE notifications (
     id           TEXT PRIMARY KEY,
-    type         TEXT NOT NULL CHECK (type IN ('flag', 'approval')),
+    type         TEXT NOT NULL CHECK (type IN ('flag', 'approval', 'decision')),
     reference_id TEXT NOT NULL,
     message      TEXT NOT NULL,
     read         BOOLEAN NOT NULL DEFAULT FALSE,

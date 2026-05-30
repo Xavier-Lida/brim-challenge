@@ -14,54 +14,34 @@ decides once. No back-and-forth.
         expenses this year. Recommendation: Approve — within policy, aligns with
         past pattern."
 
-Speaks the team's Supabase schema directly:
+Reads from and writes to Supabase (see supabase/schema.sql):
 
-  INPUTS (CSV files mirroring the tables; only `transactions` is required):
+  INPUTS (Supabase tables):
     transactions      id, employee_id, date, amount, merchant_name, merchant_category,
                       city, latitude, longitude, event_group_id, status   (amount is CAD)
-    transaction_flags transaction_id, warning_message, weight             (optional, Feature 2)
+    transaction_flags transaction_id, warning_message, weight             (optional)
     budgets           department_id, budget, quarter (Q1..Q4), year        (optional)
     employees         id, first_name, last_name, department_id            (optional)
     departments       id, department_name                                 (optional)
     employee_strikes  employee_id, strike_description, strike_date, amount_cheated (optional)
 
-  OUTPUT (JSON — ready to write back to Supabase):
+  OUTPUT (JSON + Supabase upsert):
     {
       "approval_requests": [ {id, transaction_id, employee_id, amount, reason,
                               ai_recommendation, ai_reasoning, status,
-                              approver_id, decided_at} ]               -> INSERT approval_requests
+                              approver_id, decided_at} ]               -> upsert approval_requests
       "notifications":     [ {id, type, reference_id, message, read,
-                              created_at} ]                            -> INSERT notifications
+                              created_at} ]                            -> upsert notifications
       "approver_emails":   [ {approval_request_id, to, subject, text,
-                              html, deep_link} ]                       -> send via Supabase/Resend
+                              html, deep_link} ]                       -> send via Resend
     }
 
-What it does:
-  1. Map each transaction to its employee, department and budget context.
-  2. Select transactions that need approval: amount over the threshold OR a
-     compliance flag whose weight is high enough.
-  3. Build the approver context: employee spend history + department budget status.
-  4. Produce an AI approve/review/deny recommendation that reasons over the
-     numbers (LLM, with a deterministic fallback and a --mock-llm path).
-  5. Emit approval_requests + notifications (sidebar badge + flag list) +
-     approver email payloads (with a deep link to the flag/approval).
-
-Decision mode (--decide): the approver replies once and the decision is processed —
-updates the approval_request, the transaction status, and emails the employee.
-
-Supabase (temporaire — section commentée en bas du fichier) :
-  Env vars : SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-  Activer  : décommenter la section Supabase + le flag --supabase + pip install supabase
-  Défaut   : CSV inchangé (comportement actuel)
+Env vars (via .env): SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
 
 Usage:
-    py feature3.py --transactions transactions.csv --out feature3_output.json
-    py feature3.py --transactions transactions.csv --flags transaction_flags.csv \
-        --budgets budgets.csv --employees employees.csv --departments departments.csv \
-        --strikes employee_strikes.csv --threshold 1000 --out feature3_output.json
-    py feature3.py --transactions transactions.csv --mock-llm        # no API calls
-    py feature3.py --transactions transactions.csv --decide <transaction_id> \
-        --decision approve --approver-id cfo-1                        # process a decision
+    py feature3.py --mock-llm --out feature3_output.json
+    py feature3.py --threshold 1000 --mock-llm
+    py feature3.py --decide tx-001 --decision approve --approver-id cfo-1
 """
 
 from __future__ import annotations
@@ -168,7 +148,7 @@ def _normalize_quarter(value: Any) -> str | None:
 
 
 # =========================================================================== #
-# Loaders (Supabase-shaped CSVs)
+# Loaders (Supabase)
 # =========================================================================== #
 
 def _normalize_transactions_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -209,7 +189,7 @@ def _prepare_employees_for_merge(emp: pd.DataFrame | None,
 
 def _enrich_transactions(df: pd.DataFrame, emp: pd.DataFrame | None,
                          dept: pd.DataFrame | None) -> pd.DataFrame:
-    """Attach employee name + department to transactions (shared by CSV and Supabase loaders)."""
+    """Attach employee name + department to transactions."""
     df = _normalize_transactions_columns(df)
     df["employee_name"] = None
     df["department"] = None
@@ -219,15 +199,6 @@ def _enrich_transactions(df: pd.DataFrame, emp: pd.DataFrame | None,
         df = df.drop(columns=["employee_name", "department", "department_id"], errors="ignore").merge(
             emp_merge, on="employee_id", how="left")
     return df
-
-
-def load_transactions(path: str, employees_path: str | None,
-                      departments_path: str | None) -> pd.DataFrame:
-    """Read the transactions table and attach employee name + department (id & name)."""
-    df = pd.read_csv(path, encoding="utf-8-sig")
-    emp = pd.read_csv(employees_path, encoding="utf-8-sig") if employees_path else None
-    dept = pd.read_csv(departments_path, encoding="utf-8-sig") if departments_path else None
-    return _enrich_transactions(df, emp, dept)
 
 
 def _flags_from_df(df: pd.DataFrame) -> dict[str, list[dict]]:
@@ -241,13 +212,6 @@ def _flags_from_df(df: pd.DataFrame) -> dict[str, list[dict]]:
     return flags
 
 
-def load_flags(path: str | None) -> dict[str, list[dict]]:
-    """transaction_flags -> {transaction_id: [ {warning_message, weight}, ... ]}."""
-    if not path:
-        return defaultdict(list)
-    return _flags_from_df(pd.read_csv(path, encoding="utf-8-sig"))
-
-
 def _strikes_from_df(df: pd.DataFrame) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for emp, g in df.groupby("employee_id"):
@@ -257,13 +221,6 @@ def _strikes_from_df(df: pd.DataFrame) -> dict[str, dict]:
             "descriptions": [str(x) for x in g.get("strike_description", pd.Series([])).tolist()][:5],
         }
     return out
-
-
-def load_strikes(path: str | None) -> dict[str, dict]:
-    """employee_strikes -> {employee_id: {count, total_cheated, descriptions[]}}."""
-    if not path:
-        return {}
-    return _strikes_from_df(pd.read_csv(path, encoding="utf-8-sig"))
 
 
 def _budgets_from_df(df: pd.DataFrame) -> dict[tuple[str, str, int], float]:
@@ -280,78 +237,72 @@ def _budgets_from_df(df: pd.DataFrame) -> dict[tuple[str, str, int], float]:
     return out
 
 
-def load_budgets(path: str | None) -> dict[tuple[str, str, int], float]:
-    """budgets -> {(department_id, quarter, year): budget_total}."""
-    if not path:
-        return {}
-    return _budgets_from_df(pd.read_csv(path, encoding="utf-8-sig"))
+def get_supabase_client():
+    from supabase import create_client
+
+    url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key:
+        raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env")
+    return create_client(url, key)
 
 
-# =========================================================================== #
-# Supabase (temporaire — décommenter quand prêt)
-# =========================================================================== #
-# Requires: pip install supabase  (see requirements.txt)
-# Env vars: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
-# TODO: confirm table/column names match your Supabase schema (especially `budgets`).
-#
-# def get_supabase_client():
-#     from supabase import create_client
-#     url = os.getenv("SUPABASE_URL")
-#     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-#     if not url or not key:
-#         raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env")
-#     return create_client(url, key)
-#
-#
-# def _fetch_table(client, table: str, select: str = "*") -> pd.DataFrame:
-#     """Fetch a Supabase table into a DataFrame (empty if no rows)."""
-#     res = client.table(table).select(select).execute()
-#     rows = res.data or []
-#     return pd.DataFrame(rows) if rows else pd.DataFrame()
-#
-#
-# def load_all_from_supabase(client):
-#     """Load all inputs from Supabase; returns (df, flags, strikes, budgets) like the CSV path."""
-#     tx_df = _fetch_table(client, "transactions")
-#     if tx_df.empty:
-#         raise RuntimeError("No rows in Supabase table `transactions`")
-#     flags_df = _fetch_table(client, "transaction_flags")
-#     strikes_df = _fetch_table(client, "employee_strikes")
-#     emp_df = _fetch_table(client, "employees")
-#     dept_df = _fetch_table(client, "departments")
-#     budgets_df = _fetch_table(client, "budgets")  # TODO: rename if table is `Budget`
-#     df = _enrich_transactions(tx_df, emp_df if not emp_df.empty else None,
-#                               dept_df if not dept_df.empty else None)
-#     flags = _flags_from_df(flags_df) if not flags_df.empty else {}
-#     strikes = _strikes_from_df(strikes_df) if not strikes_df.empty else {}
-#     budgets = _budgets_from_df(budgets_df) if not budgets_df.empty else {}
-#     return df, flags, strikes, budgets
-#
-#
-# def persist_pipeline_to_supabase(client, approval_requests: list[dict],
-#                                  notifications: list[dict]) -> None:
-#     """INSERT pipeline output into Supabase (strips internal _ctx fields)."""
-#     reqs = [{k: v for k, v in r.items() if not k.startswith("_")} for r in approval_requests]
-#     if reqs:
-#         client.table("approval_requests").upsert(reqs, on_conflict="id").execute()
-#     if notifications:
-#         client.table("notifications").upsert(notifications, on_conflict="id").execute()
-#     print(f"[supabase: upserted {len(reqs)} approval_requests, {len(notifications)} notifications]",
-#           file=sys.stderr)
-#
-#
-# def apply_decision_to_supabase(client, result: dict) -> None:
-#     """Apply --decide output to Supabase (approval_request + transaction + notification)."""
-#     upd = result["approval_request_update"]
-#     client.table("approval_requests").update({
-#         "status": upd["status"],
-#         "approver_id": upd["approver_id"],
-#         "decided_at": upd["decided_at"],
-#     }).eq("id", upd["id"]).execute()
-#     tx = result["transaction_update"]
-#     client.table("transactions").update({"status": tx["status"]}).eq("id", tx["transaction_id"]).execute()
-#     client.table("notifications").insert(result["notification"]).execute()
-#     print(f"[supabase: decision applied on {upd['id']}]", file=sys.stderr)
+def _fetch_table(client, table: str, select: str = "*", page_size: int = 1000) -> pd.DataFrame:
+    """Fetch a Supabase table into a DataFrame (paginated; empty if no rows)."""
+    rows: list[dict] = []
+    offset = 0
+    while True:
+        res = client.table(table).select(select).range(offset, offset + page_size - 1).execute()
+        batch = res.data or []
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def load_all_from_supabase(client):
+    """Load all inputs from Supabase; returns (df, flags, strikes, budgets)."""
+    tx_df = _fetch_table(client, "transactions")
+    if tx_df.empty:
+        raise RuntimeError("No rows in Supabase table `transactions`")
+    flags_df = _fetch_table(client, "transaction_flags")
+    strikes_df = _fetch_table(client, "employee_strikes")
+    emp_df = _fetch_table(client, "employees")
+    dept_df = _fetch_table(client, "departments")
+    budgets_df = _fetch_table(client, "budgets")
+    df = _enrich_transactions(tx_df, emp_df if not emp_df.empty else None,
+                              dept_df if not dept_df.empty else None)
+    flags = _flags_from_df(flags_df) if not flags_df.empty else {}
+    strikes = _strikes_from_df(strikes_df) if not strikes_df.empty else {}
+    budgets = _budgets_from_df(budgets_df) if not budgets_df.empty else {}
+    return df, flags, strikes, budgets
+
+
+def persist_pipeline_to_supabase(client, approval_requests: list[dict],
+                                 notifications: list[dict]) -> None:
+    """Upsert pipeline output into Supabase (strips internal _ctx fields)."""
+    reqs = [{k: v for k, v in r.items() if not k.startswith("_")} for r in approval_requests]
+    if reqs:
+        client.table("approval_requests").upsert(reqs, on_conflict="id").execute()
+    if notifications:
+        client.table("notifications").upsert(notifications, on_conflict="id").execute()
+    print(f"[supabase: upserted {len(reqs)} approval_requests, {len(notifications)} notifications]",
+          file=sys.stderr)
+
+
+def apply_decision_to_supabase(client, result: dict) -> None:
+    """Apply --decide output to Supabase (approval_request + transaction + notification)."""
+    upd = result["approval_request_update"]
+    client.table("approval_requests").update({
+        "status": upd["status"],
+        "approver_id": upd["approver_id"],
+        "decided_at": upd["decided_at"],
+    }).eq("id", upd["id"]).execute()
+    tx = result["transaction_update"]
+    client.table("transactions").update({"status": tx["status"]}).eq("id", tx["transaction_id"]).execute()
+    client.table("notifications").insert(result["notification"]).execute()
+    print(f"[supabase: decision applied on {upd['id']}]", file=sys.stderr)
 
 
 # =========================================================================== #
@@ -808,15 +759,6 @@ def main() -> int:
             pass
 
     ap = argparse.ArgumentParser(description="Feature 3 — Approval Notifications & Decision Engine.")
-    ap.add_argument("--transactions", required=True, help="transactions CSV (Supabase shape).")
-    # TODO: make --transactions optional when --supabase is enabled (see commented block below).
-    # ap.add_argument("--supabase", action="store_true",
-    #                 help="Load from / write to Supabase instead of CSV (needs env vars).")
-    ap.add_argument("--flags", default=None, help="transaction_flags CSV (optional).")
-    ap.add_argument("--budgets", default=None, help="budgets CSV: department_id, budget, quarter, year (optional).")
-    ap.add_argument("--employees", default=None)
-    ap.add_argument("--departments", default=None)
-    ap.add_argument("--strikes", default=None, help="employee_strikes CSV (optional).")
     ap.add_argument("--threshold", type=float, default=APPROVAL_THRESHOLD_CAD,
                     help=f"amount over this needs approval (default {APPROVAL_THRESHOLD_CAD:g} CAD).")
     ap.add_argument("--approver-to", default=os.getenv("APPROVER_EMAIL", "approver@company.com"))
@@ -835,15 +777,8 @@ def main() -> int:
     if args.model:
         os.environ["GEMINI_MODEL"] = args.model
 
-    # ---- Supabase path (décommenter avec la section Supabase en haut du fichier) ----
-    # if args.supabase:
-    #     client = get_supabase_client()
-    #     df, flags, strikes, budgets = load_all_from_supabase(client)
-    # else:
-    df = load_transactions(args.transactions, args.employees, args.departments)
-    flags = load_flags(args.flags)
-    strikes = load_strikes(args.strikes)
-    budgets = load_budgets(args.budgets)
+    client = get_supabase_client()
+    df, flags, strikes, budgets = load_all_from_supabase(client)
     use_llm = not args.mock_llm
 
     # ---- Decision mode -------------------------------------------------------
@@ -855,8 +790,7 @@ def main() -> int:
                                    args.decide, args.decision, args.approver_id, args.employee_to)
         if args.send:
             result["employee_email"]["sent"] = send_email_resend(result["employee_email"], args.from_addr)
-        # if args.supabase:
-        #     apply_decision_to_supabase(client, result)
+        apply_decision_to_supabase(client, result)
         output = {"feature": "3 - Approval Decision", **result}
         payload = json.dumps(output, indent=2, ensure_ascii=False)
         if args.out:
@@ -882,8 +816,7 @@ def main() -> int:
         for em in emails:
             em["sent"] = send_email_resend(em, args.from_addr)
 
-    # if args.supabase:
-    #     persist_pipeline_to_supabase(client, approval_requests, notifications)
+    persist_pipeline_to_supabase(client, approval_requests, notifications)
 
     if not args.keep_context:
         approval_requests = _strip_context(approval_requests)
