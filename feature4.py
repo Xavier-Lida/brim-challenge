@@ -24,8 +24,9 @@ Speaks the team's Supabase schema directly:
 
 What it does:
   1. Map merchant_category (MCC) -> Brim spend category via mcc_codes.csv.
-  2. Group each employee's transactions into events (deterministic clustering by
-     date proximity; LLM only labels multi-item clusters).  -> assigns event_group_id
+  2. Group each employee's transactions into events (deterministic spatiotemporal
+     clustering: date proximity, with same-city/geo gaps held together so a trip
+     survives a weekend; LLM only labels multi-item clusters). -> assigns event_group_id
   3. Pull policy flags (transaction_flags) + strike history (employee_strikes).
   4. Build one expense_report per event, with an LLM approve/deny recommendation that
      reasons over the flags + the employee's strike history.
@@ -42,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -66,8 +68,11 @@ except ImportError:
 
 DEFAULT_MODEL = "gemini-2.5-flash"
 DEFAULT_BRIM_CATEGORY = "Autre"
-GROUP_GAP_DAYS = 4            # a date gap larger than this starts a new event
+GROUP_GAP_DAYS = 4            # a date gap larger than this starts a new event (different place)
+SAME_PLACE_GAP_BONUS = 3     # same-location clusters tolerate this many EXTRA gap days (weekends mid-trip)
+GEO_SAME_KM = 50.0           # transactions within this distance count as the same place
 LABEL_BATCH_SIZE = 40        # clusters per labeling LLM call
+RECO_BATCH_SIZE = 40         # reports per recommendation LLM call
 AUTO_APPROVE_MAX_CAD = 100.0 # trivial reports below this (1 item, no flags) auto-approve
 
 
@@ -218,23 +223,64 @@ def load_strikes(path: str | None) -> dict[str, dict]:
 
 
 # =========================================================================== #
-# Grouping: deterministic clustering + LLM labeling  -> event_group_id
+# Grouping: deterministic spatiotemporal clustering + LLM labeling  -> event_group_id
 # =========================================================================== #
 
+def _norm_city(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip().lower()
+
+
+def _haversine_km(lat1: Any, lon1: Any, lat2: Any, lon2: Any) -> float | None:
+    try:
+        lat1, lon1, lat2, lon2 = (float(lat1), float(lon1), float(lat2), float(lon2))
+    except (TypeError, ValueError):
+        return None
+    if any(pd.isna(x) for x in (lat1, lon1, lat2, lon2)):
+        return None
+    r = 6371.0  # Earth radius (km)
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi, dlmb = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _same_place(a: Any, b: Any) -> bool:
+    """Same city (normalized string) or geo-coordinates within GEO_SAME_KM."""
+    ca, cb = _norm_city(a.get("city")), _norm_city(b.get("city"))
+    if ca and cb:
+        return ca == cb
+    dist = _haversine_km(a.get("latitude"), a.get("longitude"),
+                         b.get("latitude"), b.get("longitude"))
+    return dist is not None and dist <= GEO_SAME_KM
+
+
 def cluster_transactions(df: pd.DataFrame, gap_days: int) -> list[pd.DataFrame]:
-    """Per employee, sort by date, start a new cluster when the gap exceeds gap_days."""
+    """Per employee, sort by date, then split into events spatiotemporally.
+
+    A new cluster starts when the date gap from the previous transaction exceeds
+    `gap_days` — but if the two transactions are in the *same place* (same city, or
+    coordinates within GEO_SAME_KM), we tolerate `SAME_PLACE_GAP_BONUS` extra days.
+    This keeps a single trip (e.g. a San Diego conference spanning a weekend) together
+    while still splitting genuinely separate events.
+    """
     clusters: list[pd.DataFrame] = []
     for _emp, g in df.groupby("employee_id", dropna=False):
         g = g.assign(_d=g["date"].map(_parse_date)).sort_values("_d", na_position="last")
         current_idx: list[int] = []
-        prev = None
+        prev_date = None
+        prev_row = None
         for idx, row in g.iterrows():
             d = row["_d"]
-            if current_idx and prev is not None and d is not None and (d - prev).days > gap_days:
-                clusters.append(df.loc[current_idx])
-                current_idx = []
+            if current_idx and prev_date is not None and d is not None:
+                threshold = gap_days + (SAME_PLACE_GAP_BONUS if _same_place(prev_row, row) else 0)
+                if (d - prev_date).days > threshold:
+                    clusters.append(df.loc[current_idx])
+                    current_idx = []
             current_idx.append(idx)
-            prev = d if d is not None else prev
+            prev_date = d if d is not None else prev_date
+            prev_row = row
         if current_idx:
             clusters.append(df.loc[current_idx])
     return clusters
@@ -350,13 +396,16 @@ def recommend(reports: list[dict], use_llm: bool) -> None:
         chain = ChatPromptTemplate.from_messages(
             [("system", RECO_SYSTEM), ("human", RECO_HUMAN)]
         ) | make_chat_llm().with_structured_output(_reco_schema())
-        slim = [{
-            "report_id": r["id"], "title": r["title"], "employee": r["_employee_name"],
-            "department": r["_department"], "total_amount_cad": r["total_amount"],
-            "categories": r["_categories"], "warnings": r["_flags"], "strike_history": r["_strikes"],
-        } for r in judged]
-        res = chain.invoke({"reports_json": json.dumps(slim, ensure_ascii=False), "n": len(judged)})
-        by_id = {x.report_id: x for x in res.recommendations}
+        by_id: dict[str, Any] = {}
+        for start in range(0, len(judged), RECO_BATCH_SIZE):  # batch so big runs don't blow context
+            batch = judged[start:start + RECO_BATCH_SIZE]
+            slim = [{
+                "report_id": r["id"], "title": r["title"], "employee": r["_employee_name"],
+                "department": r["_department"], "total_amount_cad": r["total_amount"],
+                "categories": r["_categories"], "warnings": r["_flags"], "strike_history": r["_strikes"],
+            } for r in batch]
+            res = chain.invoke({"reports_json": json.dumps(slim, ensure_ascii=False), "n": len(batch)})
+            by_id.update({x.report_id: x for x in res.recommendations})
         for r in judged:
             x = by_id.get(r["id"])
             r["ai_recommendation"] = x.recommendation if x else "review"
