@@ -7,7 +7,8 @@ Speaks the team's Supabase schema directly:
 
   INPUTS (CSV files mirroring the tables; only `transactions` + `mcc_codes` required):
     transactions      id, employee_id, date, amount, merchant_name, merchant_category,
-                      city, latitude, longitude, event_group_id, status   (amount is CAD)
+                      city, zipcode, latitude, longitude, event_group_id, status   (amount is CAD)
+                      (location grouping uses city -> zipcode -> lat/long, whichever is present)
     mcc_codes         mcc, edited_description, ...        (merchant_category == MCC code)
     transaction_flags transaction_id, warning_message, weight             (optional, Feature 2)
     employee_strikes  employee_id, strike_description, strike_date, amount_cheated (optional)
@@ -246,13 +247,38 @@ def _haversine_km(lat1: Any, lon1: Any, lat2: Any, lon2: Any) -> float | None:
     return 2 * r * math.asin(math.sqrt(a))
 
 
+def _row_get(row: Any, *keys: str) -> Any:
+    """First non-null value among candidate column names (schema-tolerant)."""
+    for k in keys:
+        v = row.get(k) if hasattr(row, "get") else None
+        if v is not None and not (isinstance(v, float) and pd.isna(v)):
+            return v
+    return None
+
+
+def _norm_zip(value: Any) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    s = re.sub(r"\.0$", "", str(value).strip())   # 92101.0 -> 92101 (CSV numeric coercion)
+    return re.sub(r"\s+", "", s).lower()           # "H3A 1B1" -> "h3a1b1"
+
+
 def _same_place(a: Any, b: Any) -> bool:
-    """Same city (normalized string) or geo-coordinates within GEO_SAME_KM."""
-    ca, cb = _norm_city(a.get("city")), _norm_city(b.get("city"))
+    """Same location, in priority order: city -> zipcode -> geo-coords within GEO_SAME_KM.
+
+    City is the workhorse (present on most rows and the right granularity for a trip);
+    zipcode covers rows with a blank city; coordinates are a last resort. Only ever GRANTS
+    the same-place gap bonus — a missing signal degrades safely to pure date-gap grouping.
+    """
+    ca, cb = _norm_city(_row_get(a, "city")), _norm_city(_row_get(b, "city"))
     if ca and cb:
         return ca == cb
-    dist = _haversine_km(a.get("latitude"), a.get("longitude"),
-                         b.get("latitude"), b.get("longitude"))
+    za = _norm_zip(_row_get(a, "zipcode", "zip", "postal_code", "zip_code"))
+    zb = _norm_zip(_row_get(b, "zipcode", "zip", "postal_code", "zip_code"))
+    if za and zb:
+        return za == zb
+    dist = _haversine_km(_row_get(a, "latitude", "lat"), _row_get(a, "longitude", "lon", "lng"),
+                         _row_get(b, "latitude", "lat"), _row_get(b, "longitude", "lon", "lng"))
     return dist is not None and dist <= GEO_SAME_KM
 
 
