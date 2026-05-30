@@ -32,7 +32,7 @@ Point d'entrée du Brim Assistant. Reçoit l'historique complet de la conversati
 
 ### `POST /api/compliance/scan`
 
-Appelé automatiquement via le webhook à chaque nouvelle transaction, ou manuellement pour un batch. Charge toutes les policies actives depuis Supabase et les envoie à Gemini avec la transaction et son contexte (historique de l'employé, transactions récentes similaires). Gemini raisonne en contexte — il détecte par exemple un achat splitté pour contourner un seuil, ou compare un repas solo vs équipe. Si un flag est détecté, il est inséré dans `transaction_flags` avec un `weight` (1–5) et un `warning_message` explicatif. Une entrée est créée dans `notifications`. Si `weight >= 3`, un email est envoyé au company approver via Resend avec un lien direct vers le flag.
+Appelé automatiquement via le webhook à chaque nouvelle transaction, ou manuellement pour un batch. Servi par le **moteur Feature 2** (`feature2.py`, voir plus bas). Charge toutes les policies actives depuis Supabase et les envoie à Gemini avec la transaction et son contexte (historique de l'employé, transactions récentes similaires). Gemini raisonne en contexte — il détecte par exemple un achat splitté pour contourner un seuil, ou compare un repas solo vs équipe. Si un flag est détecté, il est inséré dans `transaction_flags` avec un `weight` (0–1, sévérité ; même échelle que celle lue par Feature 4) et un `warning_message` explicatif. Une entrée est créée dans `notifications`, et les violations sérieuses (`weight >= 0.66`) génèrent un `employee_strikes` pour faire ressortir les récidivistes. Si `weight >= 0.66`, un email est envoyé au company approver via Resend avec un lien direct vers le flag.
 
 ### `POST /api/policies/import`
 
@@ -56,6 +56,41 @@ Deux modes, tous deux servis par le **moteur Feature 4** (`feature4.py`, voir pl
 ### `POST /api/webhooks/supabase`
 
 Déclenché par un trigger Supabase à chaque INSERT dans `transactions`. Lance en parallèle : le scan compliance, la vérification du seuil d'approbation (si `amount` dépasse le seuil défini dans les policies, crée une entrée dans `approval_requests` et notifie l'approver), et la logique de groupement (assigne un `event_group_id` basé sur la proximité temporelle, la localisation, et l'employé). Le groupement et la génération de rapport sont délégués au moteur Feature 4 ci-dessous.
+
+---
+
+## Feature 2 — Moteur de conformité (`feature2.py`)
+
+Moteur batch autonome (même stack que Feature 4 : pandas + LangChain · Gemini) qui scanne les `transactions` contre la politique de dépenses et **produit les artefacts que Feature 4 consomme** (`transaction_flags` + `employee_strikes`). Architecture identique à Feature 4 : un cœur déterministe calcule des signaux structurés (« concerns »), le LLM ne fait que le jugement *contextuel* sur les candidats remontés. Ne plante jamais : toute erreur LLM dégrade vers un verdict déterministe. Réutilise les loaders / le mapping MCC de `feature4.py` (source unique).
+
+```
+{
+  "transaction_flags": [ {transaction_id, warning_message, weight, policy_name} ],  // -> INSERT
+  "employee_strikes":  [ {employee_id, strike_description, strike_date, amount_cheated} ], // -> INSERT
+  "notifications":     [ {type, reference_id, message, read} ],                      // -> INSERT
+  "summary": { by_severity, repeat_offenders (rangés), policy }
+}
+```
+
+**Étapes**
+
+1. **MCC → spend category** (via `feature4.load_transactions`), pour distinguer repas solo (`Repas Personnel`) vs client/équipe (`Repas Client`).
+2. **Détecteurs déterministes** (chacun produit un *concern* {code, message, weight, montant}) :
+   - **Achat splitté** : ≥ 2 charges au même marchand par un employé dans une fenêtre de `SPLIT_WINDOW_DAYS = 2` jours, chacune sous le seuil mais dont la somme l'atteint → contournement du seuil d'approbation (`weight 0.80`). *(le cas « 2× 300 \$ pour esquiver 500 \$ »)*
+   - **Doublon** : même employé + marchand + montant à `DUPLICATE_WINDOW_DAYS = 1` jour (`0.55`).
+   - **Seuil d'approbation** : montant ≥ `approval_threshold_cad` (défaut 500) et statut non approuvé (`0.55`).
+   - **Limite par catégorie** : ex. repas solo > 75 \$ (`0.45`) — encode la nuance solo vs équipe.
+   - **Marchand / catégorie restreint** (`0.70`), **montant rond** (booster seul ignoré).
+3. **Scan LLM contextuel** (uniquement les candidats, par lots de `SCAN_BATCH_SIZE = 25`) : reçoit la police, la transaction, les concerns et l'historique de dépenses de l'employé, et renvoie `{is_violation, warning_message, weight (0–1), policy}`. Fallback déterministe sinon.
+4. **Agrégation** : violations rangées par sévérité (`>= 0.66` haute), récidivistes remontés, chaque violation sérieuse → un `employee_strikes` (montant = montant propre de la transaction, pour ne pas double-compter les splits côté Feature 4).
+
+**Source des policies.** La source de vérité est la table Supabase `policies` (`id, effective_date, policy_name, policy_requirements`). En production, `/api/compliance/scan` interroge Supabase et passe les policies actives au moteur ; en batch, le moteur lit un mirror CSV de cette table (même convention que toutes les tables côté `feature*.py`). Le texte `policy_requirements` (les règles extraites des PDF par `/api/policies/import`) est passé au LLM pour le raisonnement contextuel. Les **seuils déterministes** (seuil d'approbation, limites par catégorie) utilisent des défauts intégrés — surchargés par une colonne optionnelle `approval_threshold_cad` si le mirror CSV en fournit une (commodité batch, hors schéma canonique).
+
+```
+py feature2.py --transactions transactions.csv --policies policies.csv \
+    --employees employees.csv --departments departments.csv --out feature2_output.json
+py feature2.py --transactions transactions.csv --mock-llm   # aucun appel API
+```
 
 ---
 
@@ -95,7 +130,7 @@ py feature4.py --transactions transactions.csv --mock-llm   # aucun appel API
 ```
 Nouvelle transaction
   → webhook
-    → scan compliance (Gemini) → transaction_flags + notifications + email si weight ≥ 3
+    → scan compliance (Gemini) → transaction_flags + employee_strikes + notifications + email si weight ≥ 0.66
     → montant > seuil policy   → approval_requests + email approver
     → groupement logique       → event_group_id assigné sur la transaction
 
