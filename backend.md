@@ -60,7 +60,7 @@ Reçoit un PDF (base64) ou du texte brut. Le moteur [`api/policy_import.py`](api
 
 ### `GET /api/policies` · `PATCH /api/policies/[id]` · `DELETE /api/policies/[id]`
 
-CRUD standard sur les policies. Le PATCH permet de modifier les `policy_requirements` directement depuis la modale UI. Le DELETE désactive une règle sans la supprimer (soft delete via un champ `active`).
+CRUD standard sur les policies. Le PATCH permet de modifier les `policy_requirements` et le champ `active` (toggle UI = désactiver sans supprimer). Le DELETE supprime définitivement la ligne dans `policies` (hard delete).
 
 ### `GET /api/approvals` · `PATCH /api/approvals/[id]`
 

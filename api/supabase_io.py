@@ -473,6 +473,13 @@ def deactivate_policy(client, policy_id: str) -> dict:
     return res.data[0]
 
 
+def delete_policy(client, policy_id: str) -> None:
+    """Permanently remove a policy row (use PATCH active=false to disable only)."""
+    res = client.table("policies").delete().eq("id", policy_id).execute()
+    if not res.data:
+        raise KeyError(f"Policy {policy_id} not found")
+
+
 def list_notifications(client, unread_only: bool = False) -> list[dict]:
     query = client.table("notifications").select("*")
     if unread_only:

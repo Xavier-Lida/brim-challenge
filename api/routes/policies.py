@@ -19,7 +19,7 @@ from api.policy_import import (
     extract_text_from_pdf,
 )
 from api.supabase_io import (
-    deactivate_policy,
+    delete_policy as delete_policy_row,
     insert_policies,
     list_policies,
     upsert_policy,
@@ -103,10 +103,10 @@ def update_policy(
 @router.delete("/{policy_id}")
 def delete_policy(policy_id: str, client=Depends(supabase_client)) -> dict[str, Any]:
     try:
-        row = deactivate_policy(client, policy_id)
+        delete_policy_row(client, policy_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"id": policy_id, "active": row.get("active", False)}
+    return {"id": policy_id, "deleted": True}
 
 
 @router.post("/import")
