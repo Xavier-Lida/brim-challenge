@@ -15,6 +15,7 @@ from api.data_loaders import (
     budgets_from_df,
     enrich_transactions,
     flags_from_df,
+    prepare_employees_for_merge,
     strikes_from_df,
 )
 from feature4 import (
@@ -560,22 +561,60 @@ def _geolocated_transactions(client) -> pd.DataFrame:
     return df
 
 
-def list_map_employees(client) -> list[dict[str, Any]]:
-    """Employees with at least one geolocated transaction, for the map selector."""
-    df = _geolocated_transactions(client)
-    if df.empty:
-        return []
+def list_employees(client) -> list[dict[str, Any]]:
+    """Full employee roster with geolocated transaction counts for the map."""
+    emp_df = fetch_table(client, "employees")
+    dept_df = fetch_table(client, "departments")
+    emp_merge = prepare_employees_for_merge(
+        emp_df if not emp_df.empty else None,
+        dept_df if not dept_df.empty else None,
+    )
+
+    geo_df = _geolocated_transactions(client)
+    geo_counts: dict[str, int] = {}
+    if not geo_df.empty:
+        geo_counts = {
+            str(emp_id): int(count)
+            for emp_id, count in geo_df.groupby(geo_df["employee_id"].astype(str)).size().items()
+        }
+
+    if emp_merge is not None and not emp_merge.empty:
+        out: list[dict[str, Any]] = []
+        for _, r in emp_merge.iterrows():
+            emp_id = str(r["employee_id"])
+            name = str(r.get("employee_name") or "").strip() or emp_id
+            dept = r.get("department")
+            out.append({
+                "id": emp_id,
+                "name": name,
+                "department": str(dept) if pd.notna(dept) and str(dept).strip() else None,
+                "map_transaction_count": geo_counts.get(emp_id, 0),
+            })
+        out.sort(key=lambda x: x["name"])
+        return out
+
     names = employee_name_map(client)
-    counts = df.groupby(df["employee_id"].astype(str)).size()
-    out: list[dict[str, Any]] = []
-    for emp_id, count in counts.items():
-        out.append({
+    return [
+        {
             "id": emp_id,
-            "name": names.get(emp_id, emp_id),
-            "transaction_count": int(count),
-        })
-    out.sort(key=lambda x: x["name"])
-    return out
+            "name": name or emp_id,
+            "department": None,
+            "map_transaction_count": geo_counts.get(emp_id, 0),
+        }
+        for emp_id, name in sorted(names.items(), key=lambda kv: kv[1])
+    ]
+
+
+def list_map_employees(client) -> list[dict[str, Any]]:
+    """All employees for the map selector; transaction_count is geolocated purchases only."""
+    return [
+        {
+            "id": e["id"],
+            "name": e["name"],
+            "transaction_count": e["map_transaction_count"],
+        }
+        for e in list_employees(client)
+    ]
 
 
 def build_map_purchases(

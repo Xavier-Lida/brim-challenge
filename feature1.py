@@ -125,7 +125,7 @@ def build_db(args) -> tuple[duckdb.DuckDBPyConnection, set[str]]:
     # cast date to TIMESTAMP so date_trunc/quarter/year work; keep all other columns
     con.execute("CREATE TABLE tx AS SELECT * REPLACE (TRY_CAST(date AS TIMESTAMP) AS date) FROM _tx_df")
     con.unregister("_tx_df")
-    con.execute("CREATE VIEW emp AS SELECT DISTINCT employee_id, employee_name, department FROM tx")
+    _register_emp_table(con, args.employees, args.departments)
     present = {"tx", "emp"}
 
     if args.flags:
@@ -151,8 +151,35 @@ def build_db(args) -> tuple[duckdb.DuckDBPyConnection, set[str]]:
     return con, present
 
 
+def _register_emp_table(
+    con: duckdb.DuckDBPyConnection,
+    employees_path: str | None,
+    departments_path: str | None,
+) -> None:
+    """Full employee roster in emp when CSV paths are provided; else derive from tx."""
+    from api.data_loaders import prepare_employees_for_merge
+
+    if employees_path:
+        emp_df = pd.read_csv(employees_path, encoding="utf-8-sig")
+        dept_df = (
+            pd.read_csv(departments_path, encoding="utf-8-sig")
+            if departments_path
+            else None
+        )
+        emp_merge = prepare_employees_for_merge(emp_df, dept_df)
+        if emp_merge is not None and not emp_merge.empty:
+            con.register("_emp", emp_merge)
+            con.execute("CREATE TABLE emp AS SELECT * FROM _emp")
+            con.unregister("_emp")
+            return
+    con.execute(
+        "CREATE VIEW emp AS SELECT DISTINCT employee_id, employee_name, department FROM tx"
+    )
+
+
 def build_db_from_supabase(client, limit: int | None = None) -> tuple[duckdb.DuckDBPyConnection, set[str]]:
     """Load Supabase tables into an in-memory DuckDB (same shape as build_db)."""
+    from api.data_loaders import prepare_employees_for_merge
     from api.supabase_io import fetch_table, load_transactions_frame
 
     tx = load_transactions_frame(client)
@@ -165,7 +192,21 @@ def build_db_from_supabase(client, limit: int | None = None) -> tuple[duckdb.Duc
         "CREATE TABLE tx AS SELECT * REPLACE (TRY_CAST(date AS TIMESTAMP) AS date) FROM _tx_df"
     )
     con.unregister("_tx_df")
-    con.execute("CREATE VIEW emp AS SELECT DISTINCT employee_id, employee_name, department FROM tx")
+
+    emp_df = fetch_table(client, "employees")
+    dept_df = fetch_table(client, "departments")
+    emp_merge = prepare_employees_for_merge(
+        emp_df if not emp_df.empty else None,
+        dept_df if not dept_df.empty else None,
+    )
+    if emp_merge is not None and not emp_merge.empty:
+        con.register("_emp", emp_merge)
+        con.execute("CREATE TABLE emp AS SELECT * FROM _emp")
+        con.unregister("_emp")
+    else:
+        con.execute(
+            "CREATE VIEW emp AS SELECT DISTINCT employee_id, employee_name, department FROM tx"
+        )
     present = {"tx", "emp"}
 
     flags_df = fetch_table(client, "transaction_flags")
@@ -217,6 +258,11 @@ def schema_doc(present: set[str]) -> str:
     parts = ["tx(id, employee_id, date TIMESTAMP, amount DOUBLE /*CAD*/, merchant_name, "
              "merchant_category /*MCC*/, city, zipcode, latitude, longitude, event_group_id, "
              "status, brim_category, employee_name, department)"]
+    if "emp" in present:
+        parts.append(
+            "emp(employee_id, employee_name, department) — full roster; "
+            "LEFT JOIN tx ON tx.employee_id = emp.employee_id"
+        )
     if "budget" in present:
         parts.append("budget(department, budget DOUBLE, quarter /*'Q1'..'Q4'*/, year INT)")
     if "flags" in present:
