@@ -105,7 +105,9 @@ HIGH_SEVERITY = 4        # weight >= this = strike-worthy (feature4 leans toward
 ALERT_SEVERITY = 3       # weight >= this = notify / email the approver (backend.md)
 
 # Boosters never stand alone: a transaction whose only signals are boosters is dropped.
-BOOSTER_CODES = {"round_number", "weekend"}
+# geo_anomaly is a booster: with day-granular dates (no time), charges in 2 cities the same
+# day are usually legit travel — only meaningful combined with another red flag, not alone.
+BOOSTER_CODES = {"round_number", "weekend", "geo_anomaly"}
 
 # Approved statuses -> a threshold breach that's already approved is not a violation.
 APPROVED_STATUSES = {"approved", "reimbursed", "closed", "settled"}

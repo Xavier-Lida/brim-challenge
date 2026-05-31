@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.deps import cors_origins
 from api.routes import (
     approvals,
     assistant,
@@ -33,7 +32,9 @@ app = FastAPI(title="Brim API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins(),
+    # Open to any origin (local dev, Vercel previews, prod) — the API has no cookie auth,
+    # the regex echoes the caller's origin so it stays valid alongside allow_credentials.
+    allow_origin_regex=".*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
