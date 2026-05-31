@@ -187,11 +187,49 @@ def strikes_dict_from_db(client) -> dict[str, dict]:
     return strikes_from_df(strikes_df) if not strikes_df.empty else {}
 
 
-def persist_compliance_output(client, output: dict) -> dict:
-    """Insert flags, strikes, notifications; return counts."""
+def clear_compliance_artifacts(client, transaction_ids: list[str]) -> dict[str, int]:
+    """Remove prior flags and flag notifications for transactions about to be rescanned."""
+    if not transaction_ids:
+        return {"flags_deleted": 0, "notifications_deleted": 0}
+
+    flags_res = (
+        client.table("transaction_flags")
+        .delete()
+        .in_("transaction_id", transaction_ids)
+        .execute()
+    )
+    flags_deleted = len(flags_res.data or [])
+
+    notif_res = (
+        client.table("notifications")
+        .delete()
+        .eq("type", "flag")
+        .in_("reference_id", transaction_ids)
+        .execute()
+    )
+    notifications_deleted = len(notif_res.data or [])
+
+    return {
+        "flags_deleted": flags_deleted,
+        "notifications_deleted": notifications_deleted,
+    }
+
+
+def persist_compliance_output(
+    client,
+    output: dict,
+    *,
+    transaction_ids: list[str] | None = None,
+    replace: bool = True,
+) -> dict:
+    """Insert flags, strikes, notifications; optionally clear prior flags for scanned txs."""
     flags = output.get("transaction_flags") or []
     strikes = output.get("employee_strikes") or []
     notifications = output.get("notifications") or []
+
+    cleared: dict[str, int] = {}
+    if replace and transaction_ids:
+        cleared = clear_compliance_artifacts(client, transaction_ids)
 
     inserted_flags = 0
     if flags:
@@ -209,6 +247,8 @@ def persist_compliance_output(client, output: dict) -> dict:
         inserted_notifications = len(notifications)
 
     return {
+        "flags_deleted": cleared.get("flags_deleted", 0),
+        "notifications_deleted": cleared.get("notifications_deleted", 0),
         "flags_inserted": inserted_flags,
         "strikes_inserted": inserted_strikes,
         "notifications_upserted": inserted_notifications,

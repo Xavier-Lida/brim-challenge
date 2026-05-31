@@ -76,7 +76,13 @@ def handle_supabase_webhook(
         policy = load_active_policy(client)
         scan_df = _employee_context_df(df, employee_id, transaction_id)
         compliance_out = run_compliance(scan_df, policy, use_llm=False)
-        compliance_stats = persist_compliance_output(client, compliance_out)
+        scan_ids = scan_df["id"].astype(str).tolist()
+        compliance_stats = persist_compliance_output(
+            client,
+            compliance_out,
+            transaction_ids=scan_ids,
+            replace=True,
+        )
         results["steps"].append({"compliance": compliance_stats})
     except Exception as exc:  # noqa: BLE001
         results["steps"].append({"compliance_error": str(exc)})

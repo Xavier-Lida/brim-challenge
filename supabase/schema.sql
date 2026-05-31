@@ -65,6 +65,8 @@ CREATE TABLE employee_strikes (
     amount_cheated     NUMERIC(12, 2) NOT NULL DEFAULT 0
 );
 
+-- transaction_flags.reviewed: if PATCH /api/flags/{id}/reviewed fails (PGRST204), run
+-- supabase/migrations/20260531_transaction_flags_reviewed.sql on the remote project.
 CREATE TABLE transaction_flags (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     transaction_id  TEXT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,

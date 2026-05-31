@@ -33,7 +33,7 @@
 | `budgets`           | id, department_id, budget, quarter ('Q1'–'Q4'), year, UNIQUE(department_id, quarter, year)                          |
 | `policies`          | id, effective_date, policy_name, policy_requirements **(JSONB)**, active                                            |
 | `employee_strikes`  | id, employee_id, strike_description, strike_date, amount_cheated                                                   |
-| `transaction_flags` | id, transaction_id, warning_message, weight **(SMALLINT 1–5)**, created_at                                          |
+| `transaction_flags` | id, transaction_id, warning_message, weight **(SMALLINT 1–5)**, reviewed, created_at                               |
 | `transactions`      | id, employee_id, date, amount, merchant_name, merchant_category, city, zipcode, latitude, longitude, event_group_id, status |
 | `approval_requests` | id, transaction_id, employee_id, amount, reason, ai_recommendation, ai_reasoning, status, approver_id, decided_at  |
 | `expense_reports`   | id, employee_id, event_group_id, title, date_from, date_to, total_amount, status, pdf_url, ai_recommendation, ai_reasoning |
@@ -53,6 +53,12 @@ Point d'entrée du Brim Assistant, servi par le **moteur Feature 1** (`feature1.
 ### `POST /api/compliance/scan`
 
 Appelé automatiquement via le webhook à chaque nouvelle transaction, ou manuellement pour un batch. Servi par le **moteur Feature 2** (`feature2.py`, voir plus bas). Charge toutes les policies actives depuis Supabase et les envoie à Gemini avec la transaction et son contexte (historique de l'employé, transactions récentes similaires). Gemini raisonne en contexte — il détecte par exemple un achat splitté pour contourner un seuil, ou compare un repas solo vs équipe. Si un flag est détecté, il est inséré dans `transaction_flags` avec un `weight` (entier 1–5, sévérité ; même échelle que celle lue par Feature 4) et un `warning_message` explicatif. Une entrée est créée dans `notifications` (`type='flag'`), et les violations sérieuses (`weight >= 4`) génèrent un `employee_strikes` pour faire ressortir les récidivistes. Si `weight >= 3`, un email est envoyé au company approver via Resend avec un lien direct vers le flag.
+
+### `GET /api/flags` · `PATCH /api/flags/[id]/reviewed`
+
+GET retourne les flags enrichis (transaction, employé, `reviewed`). PATCH marque un flag comme revu (`reviewed = true` en base).
+
+**Dépannage** : si PATCH renvoie **500** / **503** avec `PGRST204` ou « column reviewed », la base distante n’a pas la colonne `transaction_flags.reviewed`. Exécuter [`supabase/migrations/20260531_transaction_flags_reviewed.sql`](supabase/migrations/20260531_transaction_flags_reviewed.sql) dans le SQL Editor Supabase, puis recharger le cache PostgREST (voir [Dépannage schéma Supabase](#dépannage-schéma-supabase)).
 
 ### `POST /api/policies/import`
 
@@ -169,18 +175,51 @@ py feature4.py --transactions transactions.csv --mock-llm   # aucun appel API
 
 ---
 
+## Policies actives → flags, transactions, approvals
+
+1. **`load_active_policy`** ([`api/supabase_io.py`](api/supabase_io.py)) charge toutes les lignes `policies` avec `active = true`, fusionne le JSONB :
+   - `approval_threshold_cad` = **minimum** des seuils actifs ;
+   - `category_limits_cad` = merge par clé (dernière policy gagne en cas de conflit) ;
+   - `restricted_categories` / `restricted_merchants` = union ;
+   - `notes` → `requirements_text` pour le LLM Feature 2.
+2. **`POST /api/compliance/scan`** (et webhook transaction) exécute Feature 2 avec cette policy fusionnée. Les poids 1–5 viennent des détecteurs déterministes puis du verdict LLM (ou fallback max des concerns).
+3. **Persistance idempotente** : avec `replace=true` (défaut), les flags et notifications `type=flag` des transactions scannées sont supprimés puis réinsérés — un rescan reflète les policies courantes sans doublons.
+4. **`GET /api/transactions`** : `flag_count` et `status: flagged` (si `pending` + flags) dérivent de `transaction_flags` en base.
+5. **Feature 3** : `POST /api/approvals/run` utilise `load_active_policy` pour le seuil d'approbation et les flags en DB pour `needs_approval` / recommandations.
+
+**Catégories** : `category_limits_cad` doit utiliser les noms **Brim** (`Repas Personnel`, `Voyage`, …), pas les codes MCC bruts. Le moteur mappe `merchant_category` → `brim_category` via la table `mcc_codes` ou `mcc_codes.csv`.
+
+**Sans policy active** : repli sur `DEFAULT_POLICY` dans [`feature2.py`](feature2.py).
+
+**Rescan automatique** : après `POST` / `PATCH` / `DELETE` / `import/confirm` sur `/api/policies` (`?rescan=true` par défaut), le backend relance le scan compliance.
+
+---
+
+## Dépannage schéma Supabase
+
+Si une route échoue alors que le code est à jour, appliquer les migrations dans le **SQL Editor** Supabase (fichiers sous [`supabase/migrations/`](supabase/migrations/)) :
+
+| Symptôme | Migration |
+| -------- | --------- |
+| `PATCH /api/flags/{id}/reviewed` → 500 / PGRST204 `reviewed` | [`20260531_transaction_flags_reviewed.sql`](supabase/migrations/20260531_transaction_flags_reviewed.sql) |
+| `PATCH /api/approvals/{id}` → `notifications_type_check` / `decision` | [`20260531_notifications_decision_type.sql`](supabase/migrations/20260531_notifications_decision_type.sql) |
+
+Après exécution, attendre quelques secondes pour le cache PostgREST.
+
+---
+
 ## Flux principal
 
 ```
 Nouvelle transaction
   → webhook
-    → scan compliance (Gemini) → transaction_flags + employee_strikes + notifications + email si weight ≥ 3
+    → scan compliance (policies actives) → transaction_flags + employee_strikes + notifications
     → montant > seuil policy   → approval_requests + email approver
     → groupement logique       → event_group_id assigné sur la transaction
 
 Import policy
   → Gemini extrait les règles → preview UI → confirmation → INSERT policies
-  → ces policies sont chargées à chaque appel de /api/compliance/scan
+  → rescan compliance (défaut) → flags/transactions alignés sur les policies actives
 
 Assistant
   → messages + contexte → données Supabase injectées dans le prompt → Gemini
