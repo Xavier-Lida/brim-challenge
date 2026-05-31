@@ -85,7 +85,9 @@ Servi par le **moteur Feature 3** (`feature3.py`, voir plus bas). GET retourne l
 Deux modes, tous deux servis par le **moteur Feature 4** (`feature4.py`, voir plus bas) :
 
 - **Single** — reçoit un `event_group_id`. Récupère toutes les transactions du groupe depuis Supabase, jointes avec les données employé et les flags éventuels. Gemini génère un résumé narratif du voyage/événement, vérifie la conformité aux policies actives, identifie les anomalies, et produit une **recommandation d'approbation** (`approve` / `review` / `deny`). Le rapport est mis en forme en PDF, uploadé dans Supabase Storage, et une entrée est créée dans `expense_reports` (avec `pdf_url`, `ai_recommendation`, `ai_reasoning`, `status = ready_for_approval`).
-- **Batch** — sans `event_group_id`, le moteur regroupe lui-même les transactions récentes non assignées en événements, met à jour `transactions.event_group_id`, et crée un `expense_reports` par événement. C'est le scénario « Sarah à San Diego » : 10 transactions proches → un rapport, lié aux spend categories, prêt pour le CFO avec sa recommandation de politique.
+- **Batch** — sans `event_group_id`, le moteur regroupe les transactions non assignées en événements, met à jour `transactions.event_group_id`, et crée un `expense_reports` **par événement réel**. C'est le scénario « Sarah à San Diego » : 10 transactions proches → un rapport, lié aux spend categories, prêt pour le CFO avec sa recommandation de politique.
+
+  **Idempotence & perf** (corrige le timeout 60s + les rapports en double) : `event_group_id` et l'`id` du rapport sont **déterministes** (`uuid5` de la composition du cluster), donc un rerun *upsert* au lieu de dupliquer. Seuls les **événements réels** génèrent un rapport — clusters multi-transactions **plus** transactions isolées *matérielles* (`montant ≥ SINGLE_REPORT_MIN_CAD = 500` ou déjà signalée) ; les petites charges isolées ne créent plus de bruit. Les assignations sont persistées en **un seul appel** via la RPC `apply_event_groups` ([`supabase/migrations/20260531_apply_event_groups.sql`](supabase/migrations/20260531_apply_event_groups.sql)) — fallback en updates groupés (`.in_`) si la RPC n'est pas encore installée.
 
 ### `POST /api/webhooks/supabase`
 
@@ -105,6 +107,14 @@ Moteur de Q&R **agentique text-to-SQL**. Même stack/conventions que F2/F4 (réu
 3. **EXECUTE** — DuckDB sur `tx` (transactions enrichies : `employee_name`, `department`, `brim_category`) ⋈ `budget`, `flags`, `strikes`.
 4. **REPAIR** — sur erreur SQL, renvoie l'erreur à Gemini (jusqu'à 2 fois) → boucle agentique auto-correctrice.
 5. **NARRATE** — Gemini transforme les lignes en réponse 1–3 phrases ; la viz (`bar|line|pie|table|kpi`) suit la forme du résultat.
+
+**Règles de narration (Markdown).** Le texte utilisateur est guidé par [`prompts/assistant-narrate-rules.md`](prompts/assistant-narrate-rules.md), injecté dans le prompt NARRATE au runtime (voir `api/assistant_prompts.py`). Variable d'environnement : `ASSISTANT_NARRATE_RULES_PATH` (défaut : `prompts/assistant-narrate-rules.md`). Modifier ce fichier pour ajuster ton, périmètre, refus hors-sujet, format des montants et aide dashboard sans toucher au code Python.
+
+**Limites :** avec `--mock-llm` / `mock_llm=true`, Gemini n'est pas appelé : les réponses mock (`mock_narrate`, refus et aide dashboard déterministes) ne suivent pas le MD complet. Activer un vrai appel LLM (`mock_llm=false` + `GOOGLE_API_KEY`) pour appliquer les règles MD en narration.
+
+**Defaults (mock et PLAN) :** si l'utilisateur ne précise pas la période, le moteur assume le **trimestre courant** ; pour une comparaison de dépenses sans métrique explicite, default **`SUM(amount)`**. Les comparaisons **employé vs employé** sont supportées (noms détectés dans la question ou top 2 spenders).
+
+**Garde scope (PLAN).** Le schéma structuré inclut `in_scope` ; les questions hors périmètre renvoient le message fixe sans visualisation trompeuse.
 
 Sortie = le contrat `/api/assistant` : `{ text, visualization{type,title,data}, followUpSuggestions, sql }` (`sql` renvoyé pour la transparence). Le moteur ne décrit au LLM que les tables **présentes**, donc l'assistant couvre aussi bien les dépenses que la **surveillance / fraude** (« qui a le plus de flags ? », « récidivistes », « tentatives de split ») — sans dupliquer de détection (c'est le rôle de Feature 2 ; F1 ne fait qu'interroger ses sorties `flags`/`strikes`).
 
@@ -186,7 +196,7 @@ py feature3.py --decide tx-001 --decision approve --approver-id cfo-1
 
 ## Feature 4 — Moteur de génération de rapports (`feature4.py`)
 
-Pipeline batch autonome (pandas + LangChain · Gemini, défaut `gemini-2.5-flash` configurable via `GEMINI_MODEL` / `--model`) qui transforme des `transactions` en `expense_reports` prêts à approuver. Il parle directement le schéma Supabase via des CSV en entrée (`transactions` + `mcc_codes` requis ; `transaction_flags`, `employee_strikes`, `employees`, `departments` optionnels) et émet du JSON réinjectable :
+Pipeline batch autonome (pandas + LangChain · Gemini, défaut `gemini-3.1-flash-lite` configurable via `GEMINI_MODEL` / `--model`) qui transforme des `transactions` en `expense_reports` prêts à approuver. Il parle directement le schéma Supabase via des CSV en entrée (`transactions` + `mcc_codes` requis ; `transaction_flags`, `employee_strikes`, `employees`, `departments` optionnels) et émet du JSON réinjectable :
 
 ```
 {
@@ -243,6 +253,7 @@ Si une route échoue alors que le code est à jour, appliquer les migrations dan
 | -------- | --------- |
 | `PATCH /api/flags/{id}/reviewed` → 500 / PGRST204 `reviewed` | [`20260531_transaction_flags_reviewed.sql`](supabase/migrations/20260531_transaction_flags_reviewed.sql) |
 | `PATCH /api/approvals/{id}` → `notifications_type_check` / `decision` | [`20260531_notifications_decision_type.sql`](supabase/migrations/20260531_notifications_decision_type.sql) |
+| `POST /api/reports/generate` (batch) → **504** / lent / rapports en double | [`20260531_apply_event_groups.sql`](supabase/migrations/20260531_apply_event_groups.sql) (RPC d'assignation en masse) |
 
 Après exécution, attendre quelques secondes pour le cache PostgREST.
 

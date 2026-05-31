@@ -173,7 +173,7 @@ def _make_chat_llm():
     from langchain_google_genai import ChatGoogleGenerativeAI
 
     kwargs: dict[str, Any] = {
-        "model": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        "model": os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite"),
         "temperature": 0,
     }
     thinking = os.getenv("GEMINI_THINKING", "0")
