@@ -15,23 +15,25 @@ any LLM error degrades to a deterministic verdict.
   INPUTS (CSV files mirroring the Supabase tables; only `transactions` required):
     transactions      id, employee_id, date, amount, merchant_name, merchant_category,
                       city, zipcode, latitude, longitude, event_group_id, status  (amount CAD)
-    policies          id, effective_date, policy_name, policy_requirements  (optional;
-                      built-in defaults used if absent. Optional numeric column
-                      approval_threshold_cad overrides the default threshold.)
+    policies          id, effective_date, policy_name, policy_requirements (JSONB), active
+                      (optional; built-in defaults if absent. Structured keys in
+                      policy_requirements — approval_threshold_cad, category_limits_cad,
+                      restricted_categories, restricted_merchants — drive the deterministic
+                      checks; any "notes" free text is passed to the LLM.)
     mcc_codes         mcc, edited_description, ...           (optional, for spend categories)
     employees         id, first_name, last_name, department_id   (optional, attribution)
     departments       id, department_name                        (optional)
 
   OUTPUT (JSON — ready to write back to Supabase):
     {
-      "transaction_flags": [ {transaction_id, warning_message, weight, policy_name} ], -> INSERT
+      "transaction_flags": [ {transaction_id, warning_message, weight} ],              -> INSERT
       "employee_strikes":  [ {employee_id, strike_description, strike_date,
                               amount_cheated} ],                                        -> INSERT
-      "notifications":     [ {type, reference_id, message, read} ],                     -> INSERT
+      "notifications":     [ {id, type:"flag", reference_id, message, read} ],          -> INSERT
       "summary": { by_severity, repeat_offenders (ranked), policy }
     }
-  weight is a 0..1 severity (>= 0.66 == serious / strike-worthy), matching the scale
-  feature4.py reads.
+  weight is an INTEGER 1..5 (transaction_flags.weight CHECK in schema.sql); >= 4 is
+  strike-worthy and >= 3 alerts the approver — the scale feature4.py reads.
 
 What it does:
   1. Map MCC -> Brim spend category (so solo vs client meals are distinguishable).
@@ -55,6 +57,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from collections import defaultdict
 from typing import Any
 
@@ -77,9 +80,17 @@ DEFAULT_APPROVAL_THRESHOLD_CAD = 500.0   # purchases at/above this need pre-appr
 SPLIT_WINDOW_DAYS = 2                     # charges within this window may be one split purchase
 DUPLICATE_WINDOW_DAYS = 1                 # same merchant+amount within this window = likely duplicate
 ROUND_NUMBER_MIN_CAD = 100.0             # round-number anomaly only interesting above this
-HIGH_SEVERITY = 0.66                     # weight at/above this = strike-worthy (matches feature4)
-MEDIUM_SEVERITY = 0.40
 SCAN_BATCH_SIZE = 25                     # candidate transactions per compliance LLM call
+
+# Severity weight is an INTEGER 1..5 — the transaction_flags.weight CHECK in schema.sql.
+SEV_SPLIT = 5            # split to duck the approval threshold (clear intent)
+SEV_RESTRICTED = 4       # restricted merchant / category
+SEV_OVER_THRESHOLD = 3   # at/above approval threshold and not approved
+SEV_DUPLICATE = 3        # duplicate charge
+SEV_CATEGORY_LIMIT = 2   # over a per-category soft limit (e.g. solo meal)
+SEV_ROUND = 1            # round-number anomaly (booster; ignored on its own)
+HIGH_SEVERITY = 4        # weight >= this = strike-worthy (feature4 leans toward deny)
+ALERT_SEVERITY = 3       # weight >= this = notify / email the approver (backend.md)
 
 # Approved statuses -> a threshold breach that's already approved is not a violation.
 APPROVED_STATUSES = {"approved", "reimbursed", "closed", "settled"}
@@ -109,22 +120,73 @@ DEFAULT_POLICY: dict[str, Any] = {
 }
 
 
+def _parse_requirements(raw: Any) -> dict:
+    """`policies.policy_requirements` is JSONB. Accept a dict, a JSON string, or free text.
+
+    Recognized structured keys: approval_threshold_cad, category_limits_cad,
+    restricted_categories, restricted_merchants, notes. Anything unparseable is treated
+    as free-text `notes` and handed to the LLM."""
+    if isinstance(raw, dict):
+        return dict(raw)
+    s = str(raw).strip()
+    if not s:
+        return {}
+    try:
+        parsed = json.loads(s)
+        return parsed if isinstance(parsed, dict) else {"notes": s}
+    except (json.JSONDecodeError, ValueError):
+        return {"notes": s}
+
+
 def load_policy(path: str | None) -> dict[str, Any]:
-    """Merge the built-in policy with an optional Supabase `policies` CSV."""
-    policy = {**DEFAULT_POLICY, "category_limits_cad": dict(DEFAULT_POLICY["category_limits_cad"])}
+    """Merge built-in defaults with the active rows of the Supabase `policies` table
+    (CSV mirror for batch runs). Structured keys in the JSONB `policy_requirements` drive
+    the deterministic thresholds; free-text notes are passed to the LLM for context."""
+    policy = {
+        **DEFAULT_POLICY,
+        "category_limits_cad": dict(DEFAULT_POLICY["category_limits_cad"]),
+        "restricted_categories": list(DEFAULT_POLICY["restricted_categories"]),
+        "restricted_merchants": list(DEFAULT_POLICY["restricted_merchants"]),
+    }
     if not path:
         return policy
+
     df = pd.read_csv(path, encoding="utf-8-sig").fillna("")
-    texts = [str(t) for t in df.get("policy_requirements", pd.Series([], dtype=str)).tolist() if str(t).strip()]
-    if texts:
-        policy["requirements_text"] = "  ".join(texts)
-    names = [str(n) for n in df.get("policy_name", pd.Series([], dtype=str)).tolist() if str(n).strip()]
+    names: list[str] = []
+    notes: list[str] = []
+    thresholds: list[float] = []
+    for _, row in df.iterrows():
+        if "active" in df.columns and str(row.get("active")).strip().lower() in ("false", "0", "no", "f"):
+            continue
+        name = str(row.get("policy_name", "")).strip()
+        if name:
+            names.append(name)
+        rules = _parse_requirements(row.get("policy_requirements", ""))
+        if rules.get("approval_threshold_cad") is not None:
+            try:
+                thresholds.append(float(rules["approval_threshold_cad"]))
+            except (TypeError, ValueError):
+                pass
+        for k, v in (rules.get("category_limits_cad") or {}).items():
+            try:
+                policy["category_limits_cad"][str(k)] = float(v)
+            except (TypeError, ValueError):
+                pass
+        policy["restricted_categories"].extend(str(c) for c in (rules.get("restricted_categories") or []))
+        policy["restricted_merchants"].extend(str(m) for m in (rules.get("restricted_merchants") or []))
+        if rules.get("notes"):
+            notes.append(str(rules["notes"]))
+
+    if thresholds:
+        policy["approval_threshold_cad"] = min(thresholds)   # tightest active threshold wins
     if names:
         policy["policy_name"] = names[0] if len(names) == 1 else f"{len(names)} active policies"
-    if "approval_threshold_cad" in df.columns:    # optional structured override
-        vals = pd.to_numeric(df["approval_threshold_cad"], errors="coerce").dropna()
-        if len(vals):
-            policy["approval_threshold_cad"] = float(vals.min())
+    policy["requirements_text"] = "  ".join(notes) if notes else json.dumps({
+        "approval_threshold_cad": policy["approval_threshold_cad"],
+        "category_limits_cad": policy["category_limits_cad"],
+        "restricted_categories": policy["restricted_categories"],
+        "restricted_merchants": policy["restricted_merchants"],
+    }, ensure_ascii=False)
     return policy
 
 
@@ -163,7 +225,7 @@ def detect_splits(df: pd.DataFrame, threshold: float, window_days: int) -> dict[
                         "message": (f"Possible split: {len(window)} charges totaling ${total:.2f} to the "
                                     f"same merchant within {window_days} day(s), each under the "
                                     f"${threshold:.0f} approval threshold."),
-                        "weight": 0.80,
+                        "weight": SEV_SPLIT,
                         "amount_at_risk": total,
                     })
                 i = j
@@ -189,7 +251,7 @@ def detect_duplicates(df: pd.DataFrame, window_days: int) -> dict[str, list[dict
                         "code": "duplicate_charge",
                         "message": f"Possible duplicate: identical ${float(_amt):.2f} charge to the "
                                    f"same merchant within {window_days} day(s).",
-                        "weight": 0.55,
+                        "weight": SEV_DUPLICATE,
                         "amount_at_risk": round(float(_amt), 2),
                     })
     return out
@@ -209,7 +271,7 @@ def detect_row_concerns(row: pd.Series, policy: dict) -> list[dict]:
             "code": "over_threshold",
             "message": f"${amount:.2f} is at/above the ${threshold:.0f} pre-approval threshold "
                        f"and is not marked approved (status='{status or 'n/a'}').",
-            "weight": 0.55,
+            "weight": SEV_OVER_THRESHOLD,
             "amount_at_risk": round(amount, 2),
         })
 
@@ -219,7 +281,7 @@ def detect_row_concerns(row: pd.Series, policy: dict) -> list[dict]:
         concerns.append({
             "code": "category_limit",
             "message": f"${amount:.2f} exceeds the ${limit:.0f} limit for {kind} ({category}).",
-            "weight": 0.45,
+            "weight": SEV_CATEGORY_LIMIT,
             "amount_at_risk": round(amount - limit, 2),
         })
 
@@ -227,14 +289,14 @@ def detect_row_concerns(row: pd.Series, policy: dict) -> list[dict]:
         concerns.append({
             "code": "restricted_category",
             "message": f"Category '{category}' is restricted under the expense policy.",
-            "weight": 0.70,
+            "weight": SEV_RESTRICTED,
             "amount_at_risk": round(amount, 2),
         })
     if any(rm and rm in merchant for rm in (m.lower() for m in policy["restricted_merchants"])):
         concerns.append({
             "code": "restricted_merchant",
             "message": f"Merchant '{row.get('merchant_name')}' is on the restricted list.",
-            "weight": 0.70,
+            "weight": SEV_RESTRICTED,
             "amount_at_risk": round(amount, 2),
         })
 
@@ -242,7 +304,7 @@ def detect_row_concerns(row: pd.Series, policy: dict) -> list[dict]:
         concerns.append({
             "code": "round_number",
             "message": f"Round-number amount (${amount:.2f}) — weak anomaly signal.",
-            "weight": 0.25,
+            "weight": SEV_ROUND,
             "amount_at_risk": round(amount, 2),
         })
     return concerns
@@ -297,7 +359,7 @@ def _verdict_schema():
         transaction_id: str
         is_violation: bool = Field(description="true if this transaction violates the policy")
         warning_message: str = Field(description="specific, references amounts/merchant/category/pattern")
-        weight: float = Field(description="severity 0..1 (>=0.66 serious/strike-worthy)")
+        weight: int = Field(description="integer severity 1..5 (5=clear/intentional, 3=needs review, 1=weak)")
         policy: str = Field(description="which rule it breaches, or 'compliant'")
 
     class Batch(BaseModel):
@@ -313,9 +375,10 @@ computed, and the employee's recent spend context. Decide whether it actually vi
 policy and reason IN CONTEXT — a client/team meal differs from a solo meal; several
 charges to one merchant just under the approval threshold is a split to dodge approval;
 identical repeated charges are duplicates; flag personal spend on the corporate card.
-Assign a severity weight 0..1 (>=0.66 = serious / strike-worthy). Reference the actual
-numbers, merchant, category, threshold, and any pattern. If on reflection it is fine,
-return is_violation=false. Be concise."""
+Assign an INTEGER severity weight 1..5 (5 = clear/intentional violation, 4 = serious,
+3 = needs approver review, 2 = soft-limit breach, 1 = weak signal); >=4 is strike-worthy.
+Reference the actual numbers, merchant, category, threshold, and any pattern. If on
+reflection it is fine, return is_violation=false. Be concise."""
 
 SCAN_HUMAN = """Active policy: {policy_name}
 Policy requirements: {requirements}
@@ -328,12 +391,12 @@ Judge all {n}."""
 
 
 def _fallback_verdict(tid: str, concerns: list[dict], policy_name: str) -> dict:
-    weight = min(1.0, max(c["weight"] for c in concerns))
+    weight = max(1, min(5, max(int(c["weight"]) for c in concerns)))
     return {
         "transaction_id": tid,
         "is_violation": True,
         "warning_message": "; ".join(c["message"] for c in concerns),
-        "weight": round(weight, 2),
+        "weight": weight,
         "policy": policy_name,
     }
 
@@ -383,7 +446,7 @@ def scan(df: pd.DataFrame, concerns: dict[str, list[dict]], policy: dict,
                         "transaction_id": v.transaction_id,
                         "is_violation": bool(v.is_violation),
                         "warning_message": v.warning_message,
-                        "weight": round(max(0.0, min(1.0, float(v.weight))), 2),
+                        "weight": max(1, min(5, int(round(float(v.weight))))),
                         "policy": v.policy,
                     }
         # any candidate the model dropped -> deterministic fallback
@@ -400,8 +463,8 @@ def scan(df: pd.DataFrame, concerns: dict[str, list[dict]], policy: dict,
 # Assemble outputs: transaction_flags, employee_strikes, notifications, summary
 # =========================================================================== #
 
-def _severity_band(w: float) -> str:
-    return "high" if w >= HIGH_SEVERITY else ("medium" if w >= MEDIUM_SEVERITY else "low")
+def _severity_band(w: int) -> str:
+    return "high" if w >= HIGH_SEVERITY else ("medium" if w >= 2 else "low")
 
 
 def build_outputs(df: pd.DataFrame, verdicts: dict[str, dict], policy: dict) -> dict:
@@ -422,14 +485,14 @@ def build_outputs(df: pd.DataFrame, verdicts: dict[str, dict], policy: dict) -> 
         # which sums amount_cheated across strikes, doesn't double-count siblings.
         own_amount = round(float(r["amount"]), 2)
 
-        flags.append({
+        flags.append({   # exactly the insertable transaction_flags columns
             "transaction_id": tid,
             "warning_message": v["warning_message"],
             "weight": weight,
-            "policy_name": v.get("policy") or policy["policy_name"],
         })
-        notifications.append({
-            "type": "compliance_alert" if band == "high" else "compliance_flag",
+        notifications.append({   # notifications.type CHECK IN ('flag','approval'); id has no default
+            "id": uuid.uuid4().hex,
+            "type": "flag",
             "reference_id": tid,
             "message": f"[{band.upper()}] {v['warning_message']}",
             "read": False,

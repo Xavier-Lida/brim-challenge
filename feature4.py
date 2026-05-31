@@ -377,11 +377,11 @@ def _label_llm(multi: list[pd.DataFrame]) -> list[dict]:
 
 RECO_SYSTEM = """You are an AI expense-approval assistant for a corporate finance team.
 Given one expense report — its transactions, category totals, policy warnings (from the
-compliance engine, each with a severity weight), and the employee's strike history —
+compliance engine, each with a severity weight 1..5), and the employee's strike history —
 recommend one of: "approve", "review", or "deny" for the CFO.
 - approve: clearly within policy, no material warnings.
-- review: needs a human look (large amount, partial context, low-weight warnings).
-- deny: clear violation (high-weight warnings, or a repeat offender with prior strikes).
+- review: needs a human look (large amount, partial context, low-weight warnings 1-3).
+- deny: clear violation (high-weight warnings >=4, or a repeat offender with prior strikes).
 Reference the actual numbers, warnings, and strike history. Be concise."""
 
 RECO_HUMAN = """Reports (JSON array). Return one recommendation per report, echoing report_id.
@@ -440,7 +440,7 @@ def recommend(reports: list[dict], use_llm: bool) -> None:
         for r in judged:  # deterministic fallback
             max_w = max((f["weight"] for f in r["_flags"]), default=0)
             strikes = r["_strikes"]["count"] if r["_strikes"] else 0
-            if r["_flags"] and (max_w >= 0.66 or strikes >= 2):
+            if r["_flags"] and (max_w >= 4 or strikes >= 2):   # weight is 1..5 (schema.sql)
                 dec = "deny"
             elif r["_flags"] or r["total_amount"] > 500:
                 dec = "review"
