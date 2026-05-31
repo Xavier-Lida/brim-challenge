@@ -50,7 +50,9 @@
 
 ### `POST /api/assistant`
 
-Point d'entrée du Brim Assistant, servi par le **moteur Feature 1** (`feature1.py`, voir plus bas). Reçoit l'historique de la conversation + un contexte optionnel. Plutôt que d'injecter les transactions dans le prompt (qui ne passe pas à l'échelle sur des milliers de lignes), Gemini **génère une requête SQL** que le serveur exécute en lecture seule contre les données (DuckDB en local / Supabase en prod), s'auto-corrige en cas d'erreur, puis rédige la réponse. Retourne `{ text, visualization: { type, title, data }, followUpSuggestions, sql }`. Le type de visualisation (bar, line, pie, table, kpi) suit la forme du résultat ; les `followUpSuggestions` proviennent d'un registre de capacités testées (puces toujours répondables), la saisie restant libre.
+Point d'entrée du Brim Assistant, servi par le **moteur Feature 1** (`feature1.py`, voir plus bas). Reçoit l'historique de la conversation + un contexte optionnel. Plutôt que d'injecter les transactions dans le prompt (qui ne passe pas à l'échelle sur des milliers de lignes), Gemini **génère une requête SQL** que le serveur exécute en lecture seule contre les données (DuckDB en local / Supabase en prod), s'auto-corrige en cas d'erreur, puis rédige la réponse. Retourne `{ text, visualization: { type, title, data }, followUpSuggestions, sql, engine, mock }`. Le type de visualisation (bar, line, pie, table, kpi) suit la forme du résultat ; les `followUpSuggestions` proviennent d'un registre de capacités testées (puces toujours répondables), la saisie restant libre.
+
+> **Indicateur de moteur (`engine`).** La réponse expose `engine` ∈ {`gemini`, `mock`, `degraded`} + booléen `mock` : `gemini` = vrai appel LLM, `mock` = `mock_llm=true` forcé, `degraded` = le LLM a échoué (clé/quota absent) et le serveur est retombé silencieusement sur le mock. Tout résultat non-`gemini` est **préfixé de `[M] `** dans le texte (aide de debug visible jusque dans l'UI). Le endpoint `/api/assistant/stream` dégrade lui aussi vers un mock taggé `[M]` au lieu de renvoyer une erreur dure (cohérent avec « jamais d'échec dur »). Test rapide : `curl -X POST ".../api/assistant?mock_llm=false" … | grep engine` → `"engine":"gemini"` = la clé marche.
 
 ### `POST /api/compliance/scan`
 
@@ -107,14 +109,14 @@ Moteur de Q&R **agentique text-to-SQL**. Même stack/conventions que F2/F4 (réu
 1. **PLAN** — Gemini → `{sql, chart, title}` (sortie structurée) depuis la question + l'historique + le schéma.
 2. **GUARD** — rejette tout sauf un unique `SELECT`/`WITH` lecture seule ; injecte un `LIMIT`.
 3. **EXECUTE** — DuckDB sur `tx` (transactions enrichies : `employee_name`, `department`, `brim_category`) ⋈ `budget`, `flags`, `strikes`.
-4. **REPAIR** — sur erreur SQL, renvoie l'erreur à Gemini (jusqu'à 2 fois) → boucle agentique auto-correctrice.
-5. **NARRATE** — Gemini transforme les lignes en réponse 1–3 phrases ; la viz (`bar|line|pie|table|kpi`) suit la forme du résultat.
+4. **REPAIR** — sur erreur SQL, un **fix déterministe** corrige d'abord le motif fréquent « agrégat nu dans `WHERE` » (`date_trunc('quarter', MAX(date))` → sous-requête scalaire `(SELECT max(date) FROM tx)`, scopé à la clause WHERE/HAVING) ; sinon l'erreur est renvoyée à Gemini (jusqu'à 2 fois) → boucle agentique auto-correctrice. Le prompt PLAN interdit désormais explicitement les agrégats dans `WHERE`/`HAVING`.
+5. **NARRATE** — Gemini transforme les lignes en réponse 1–3 phrases, **ancrée au nombre de lignes réel** (jamais « les 3 marchands » si la requête n'en renvoie que 2) ; la viz (`bar|line|pie|table|kpi`) suit la forme du résultat.
 
 **Règles de narration (Markdown).** Le texte utilisateur est guidé par [`prompts/assistant-narrate-rules.md`](prompts/assistant-narrate-rules.md), injecté dans le prompt NARRATE au runtime (voir `api/assistant_prompts.py`). Variable d'environnement : `ASSISTANT_NARRATE_RULES_PATH` (défaut : `prompts/assistant-narrate-rules.md`). Modifier ce fichier pour ajuster ton, périmètre, refus hors-sujet, format des montants et aide dashboard sans toucher au code Python.
 
 **Limites :** avec `--mock-llm` / `mock_llm=true`, Gemini n'est pas appelé : les réponses mock (`mock_narrate`, refus et aide dashboard déterministes) ne suivent pas le MD complet. Activer un vrai appel LLM (`mock_llm=false` + `GOOGLE_API_KEY`) pour appliquer les règles MD en narration.
 
-**Defaults (mock et PLAN) :** si l'utilisateur ne précise pas la période, le moteur assume le **trimestre courant** ; pour une comparaison de dépenses sans métrique explicite, default **`SUM(amount)`**. Les comparaisons **employé vs employé** sont supportées (noms détectés dans la question ou top 2 spenders).
+**Defaults (mock et PLAN) :** le **trimestre courant** n'est assumé que pour les questions de **dépenses/montants** sans période. Les questions de **comptage/recherche** (flags, conformité, strikes, approbations) et les suivis « laquelle / which » **n'imposent aucun filtre de date** — comptage/listing sur tout le jeu, pour une réponse **stable** (corrige le « 1 vs 1063 » et le « laquelle ? » qui sautait d'une transaction à l'autre). Pour une comparaison de dépenses sans métrique explicite, default **`SUM(amount)`**. Les comparaisons **employé vs employé** sont supportées (noms détectés dans la question ou top 2 spenders).
 
 **Garde scope (PLAN).** Le schéma structuré inclut `in_scope` ; les questions hors périmètre renvoient le message fixe sans visualisation trompeuse.
 
@@ -234,8 +236,10 @@ py feature4.py --transactions transactions.csv --mock-llm   # aucun appel API
    - `category_limits_cad` = merge par clé (dernière policy gagne en cas de conflit) ;
    - `restricted_categories` / `restricted_merchants` = union ;
    - `notes` → `requirements_text` pour le LLM Feature 2.
+
+   > **Fidélité à la source (`load_policy_from_dataframe`).** Dès qu'au moins **une** policy active existe, `category_limits_cad` / `restricted_*` sont dérivés **uniquement** de ces policies — les valeurs codées en dur de `DEFAULT_POLICY` (ex. caps repas $75/$250) **ne sont plus injectées**. `DEFAULT_POLICY` ne sert que de repli **total** quand il n'y a **aucune** policy. Évite de signaler des limites que le document importé n'a jamais énoncées (le PDF Brim ne donne aucun plafond repas chiffré).
 2. **`POST /api/compliance/scan`** (et webhook transaction) exécute Feature 2 avec cette policy fusionnée. Les poids 1–5 viennent des détecteurs déterministes puis du verdict LLM (ou fallback max des concerns).
-3. **Persistance idempotente** : avec `replace=true` (défaut), les flags et notifications `type=flag` des transactions scannées sont supprimés puis réinsérés — un rescan reflète les policies courantes sans doublons.
+3. **Persistance idempotente** : avec `replace=true` (défaut), les flags et notifications `type=flag` des transactions scannées sont supprimés puis réinsérés — un rescan reflète les policies courantes sans doublons. Les suppressions (`.in_`) **et** les insertions sont **chunkées par 200** ([`api/supabase_io.py`](api/supabase_io.py) : `clear_compliance_artifacts`, `persist_compliance_output`) : sans ça, un `IN`/payload de plusieurs milliers d'ids dépasse la limite d'URL/charge PostgREST et le scan complet (~2700 lignes) renvoie **500**.
 4. **`GET /api/transactions`** : `flag_count` et `status: flagged` (si `pending` + flags) dérivent de `transaction_flags` en base.
 5. **Feature 3** : `POST /api/approvals/run` utilise `load_active_policy` pour le seuil d'approbation et les flags en DB pour `needs_approval` / recommandations.
 
