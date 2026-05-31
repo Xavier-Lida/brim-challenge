@@ -209,27 +209,40 @@ def strikes_dict_from_db(client) -> dict[str, dict]:
     return strikes_from_df(strikes_df) if not strikes_df.empty else {}
 
 
+# PostgREST encodes .in_() as a URL query param, so a few thousand ids in one call blows
+# past the server's URI length limit and 500s. Chunk every bulk id filter / insert.
+_DB_CHUNK = 200
+
+
+def _chunked(seq: list, size: int = _DB_CHUNK):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
 def clear_compliance_artifacts(client, transaction_ids: list[str]) -> dict[str, int]:
     """Remove prior flags and flag notifications for transactions about to be rescanned."""
     if not transaction_ids:
         return {"flags_deleted": 0, "notifications_deleted": 0}
 
-    flags_res = (
-        client.table("transaction_flags")
-        .delete()
-        .in_("transaction_id", transaction_ids)
-        .execute()
-    )
-    flags_deleted = len(flags_res.data or [])
+    flags_deleted = 0
+    notifications_deleted = 0
+    for chunk in _chunked(transaction_ids):
+        flags_res = (
+            client.table("transaction_flags")
+            .delete()
+            .in_("transaction_id", chunk)
+            .execute()
+        )
+        flags_deleted += len(flags_res.data or [])
 
-    notif_res = (
-        client.table("notifications")
-        .delete()
-        .eq("type", "flag")
-        .in_("reference_id", transaction_ids)
-        .execute()
-    )
-    notifications_deleted = len(notif_res.data or [])
+        notif_res = (
+            client.table("notifications")
+            .delete()
+            .eq("type", "flag")
+            .in_("reference_id", chunk)
+            .execute()
+        )
+        notifications_deleted += len(notif_res.data or [])
 
     return {
         "flags_deleted": flags_deleted,
@@ -254,19 +267,19 @@ def persist_compliance_output(
         cleared = clear_compliance_artifacts(client, transaction_ids)
 
     inserted_flags = 0
-    if flags:
-        res = client.table("transaction_flags").insert(flags).execute()
-        inserted_flags = len(res.data or [])
+    for chunk in _chunked(flags):
+        res = client.table("transaction_flags").insert(chunk).execute()
+        inserted_flags += len(res.data or [])
 
     inserted_strikes = 0
-    if strikes:
-        res = client.table("employee_strikes").insert(strikes).execute()
-        inserted_strikes = len(res.data or [])
+    for chunk in _chunked(strikes):
+        res = client.table("employee_strikes").insert(chunk).execute()
+        inserted_strikes += len(res.data or [])
 
     inserted_notifications = 0
-    if notifications:
-        client.table("notifications").upsert(notifications, on_conflict="id").execute()
-        inserted_notifications = len(notifications)
+    for chunk in _chunked(notifications):
+        client.table("notifications").upsert(chunk, on_conflict="id").execute()
+        inserted_notifications += len(chunk)
 
     return {
         "flags_deleted": cleared.get("flags_deleted", 0),
