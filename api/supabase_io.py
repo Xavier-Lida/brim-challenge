@@ -256,6 +256,78 @@ def persist_reports_output(client, assignments: list[dict], reports: list[dict])
     return {"event_groups_updated": updated_groups, "reports_upserted": inserted_reports}
 
 
+def employee_name_map(client) -> dict[str, str]:
+    emp_df = fetch_table(client, "employees")
+    names: dict[str, str] = {}
+    if emp_df.empty:
+        return names
+    for _, r in emp_df.iterrows():
+        parts = [
+            str(r.get(c, "")).strip()
+            for c in ("first_name", "last_name")
+            if c in emp_df.columns
+        ]
+        names[str(r["id"])] = " ".join(p for p in parts if p).strip()
+    return names
+
+
+def flag_counts_for_transactions(client, transaction_ids: list[str]) -> dict[str, int]:
+    if not transaction_ids:
+        return {}
+    counts: dict[str, int] = defaultdict(int)
+    res = (
+        client.table("transaction_flags")
+        .select("transaction_id")
+        .in_("transaction_id", transaction_ids)
+        .execute()
+    )
+    for row in res.data or []:
+        counts[str(row["transaction_id"])] += 1
+    return dict(counts)
+
+
+def list_transactions_page(client, limit: int = 30, offset: int = 0) -> dict[str, Any]:
+    res = (
+        client.table("transactions")
+        .select("*")
+        .order("date", desc=True)
+        .order("id", desc=True)
+        .range(offset, offset + limit - 1)
+        .execute()
+    )
+    rows = res.data or []
+    emp_names = employee_name_map(client)
+    tx_ids = [str(r["id"]) for r in rows]
+    flag_counts = flag_counts_for_transactions(client, tx_ids)
+
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        tid = str(r["id"])
+        emp_id = str(r.get("employee_id", ""))
+        status = str(r.get("status", "pending"))
+        if flag_counts.get(tid, 0) > 0 and status == "pending":
+            status = "flagged"
+        items.append({
+            "id": tid,
+            "employee_id": emp_id,
+            "employee_name": emp_names.get(emp_id, emp_id),
+            "date": str(r.get("date", ""))[:10],
+            "amount": float(r.get("amount", 0)),
+            "merchant_name": str(r.get("merchant_name", "")),
+            "merchant_category": str(r.get("merchant_category", "")),
+            "city": str(r.get("city", "")),
+            "status": status,
+            "flag_count": flag_counts.get(tid, 0),
+        })
+
+    return {
+        "items": items,
+        "has_more": len(items) == limit,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
 def list_flags_enriched(client) -> list[dict]:
     flags_df = fetch_table(client, "transaction_flags")
     if flags_df.empty:
