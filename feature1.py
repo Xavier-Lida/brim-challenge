@@ -459,9 +459,12 @@ When the question is about Brim dashboard navigation only (where to click, which
 set in_scope=true and use: SELECT 'dashboard_help' AS topic LIMIT 1 with chart=table and
 title='Brim dashboard'.
 
-Defaults when the user omits details: current quarter
-(date >= date_trunc('quarter', (SELECT max(date) FROM tx))) for period; ROUND(SUM(amount),2)
-for spend comparisons. Filter tx.employee_name when two
+Period defaults: assume the current quarter
+(date >= date_trunc('quarter', (SELECT max(date) FROM tx))) ONLY for spend/amount questions
+that omit a period. For counts or lookups of flagged transactions, compliance flags, strikes,
+or approvals — and for "which one / laquelle" follow-ups — do NOT add any date filter unless
+the user names a period; count or list across all data so the answer is stable. Use
+ROUND(SUM(amount),2) for spend comparisons. Filter tx.employee_name when two
 employees are named or when comparing employees.
 
 {schema}
