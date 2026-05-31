@@ -90,9 +90,11 @@ def create_mock_transaction(
     except Exception as exc:  # noqa: BLE001 — never fail the demo on a scan hiccup
         logger.warning("mock tx compliance scan failed: %s", exc)
 
+    # select("*") so the query never breaks on a column that may not exist on this
+    # schema variant (e.g. policy_name lives on `policies`, not transaction_flags).
     fl = (
         client.table("transaction_flags")
-        .select("warning_message, weight, policy_name, incident_id")
+        .select("*")
         .eq("transaction_id", tx_id)
         .execute()
     )
