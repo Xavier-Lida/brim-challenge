@@ -85,8 +85,10 @@ def make_chat_llm(temperature: float = 0):
     """Chat LLM with Gemini 'thinking' disabled by default (faster for extraction)."""
     from langchain_google_genai import ChatGoogleGenerativeAI
 
-    kwargs = {"model": get_model(), "temperature": temperature}
-    if os.getenv("GEMINI_THINKING", "0") == "0":
+    model = get_model()
+    kwargs = {"model": model, "temperature": temperature}
+    # thinking_budget is a Gemini 2.5 feature; other models (e.g. 2.0-flash) reject it.
+    if "2.5" in model and os.getenv("GEMINI_THINKING", "0") == "0":
         kwargs["thinking_budget"] = 0
     return ChatGoogleGenerativeAI(**kwargs)
 

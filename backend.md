@@ -92,6 +92,14 @@ Moteur de Q&R **agentique text-to-SQL**. Même stack/conventions que F2/F4 (réu
 4. **REPAIR** — sur erreur SQL, renvoie l'erreur à Gemini (jusqu'à 2 fois) → boucle agentique auto-correctrice.
 5. **NARRATE** — Gemini transforme les lignes en réponse 1–3 phrases ; la viz (`bar|line|pie|table|kpi`) suit la forme du résultat.
 
+**Règles de narration (Markdown).** Le texte utilisateur est guidé par [`prompts/assistant-narrate-rules.md`](prompts/assistant-narrate-rules.md), injecté dans le prompt NARRATE au runtime (voir `api/assistant_prompts.py`). Variable d'environnement : `ASSISTANT_NARRATE_RULES_PATH` (défaut : `prompts/assistant-narrate-rules.md`). Modifier ce fichier pour ajuster ton, périmètre, refus hors-sujet, format des montants et aide dashboard sans toucher au code Python.
+
+**Limites :** avec `--mock-llm` / `mock_llm=true`, Gemini n'est pas appelé : les réponses mock (`mock_narrate`, refus et aide dashboard déterministes) ne suivent pas le MD complet. Activer un vrai appel LLM (`mock_llm=false` + `GOOGLE_API_KEY`) pour appliquer les règles MD en narration.
+
+**Defaults (mock et PLAN) :** si l'utilisateur ne précise pas la période, le moteur assume le **trimestre courant** ; pour une comparaison de dépenses sans métrique explicite, default **`SUM(amount)`**. Les comparaisons **employé vs employé** sont supportées (noms détectés dans la question ou top 2 spenders).
+
+**Garde scope (PLAN).** Le schéma structuré inclut `in_scope` ; les questions hors périmètre renvoient le message fixe sans visualisation trompeuse.
+
 Sortie = le contrat `/api/assistant` : `{ text, visualization{type,title,data}, followUpSuggestions, sql }` (`sql` renvoyé pour la transparence). Le moteur ne décrit au LLM que les tables **présentes**, donc l'assistant couvre aussi bien les dépenses que la **surveillance / fraude** (« qui a le plus de flags ? », « récidivistes », « tentatives de split ») — sans dupliquer de détection (c'est le rôle de Feature 2 ; F1 ne fait qu'interroger ses sorties `flags`/`strikes`).
 
 ```

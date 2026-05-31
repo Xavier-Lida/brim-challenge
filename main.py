@@ -1,3 +1,6 @@
+import logging
+import os
+
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +19,13 @@ from api.routes import (
 )
 
 load_dotenv()
+
+logger = logging.getLogger("brim")
+if not os.getenv("GOOGLE_API_KEY"):
+    logger.warning(
+        "GOOGLE_API_KEY is not set — the assistant will run in DEGRADED (mock) mode. "
+        "Set GOOGLE_API_KEY to enable the real Gemini engine."
+    )
 
 app = FastAPI(title="Brim API", version="1.0.0")
 
