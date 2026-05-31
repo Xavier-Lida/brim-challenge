@@ -13,6 +13,7 @@ from api.deps import supabase_client
 from api.policy_import import (
     PdfTextExtractionError,
     PdfValidationError,
+    assign_policy_ids,
     decode_pdf_base64,
     extract_policies_from_text,
     extract_text_from_pdf,
@@ -136,13 +137,13 @@ def import_policies_preview(
         content = (body.content or "").strip()
 
     use_llm = not mock_llm
-    policies = extract_policies_from_text(content, use_llm=use_llm)
+    policies = assign_policy_ids(extract_policies_from_text(content, use_llm=use_llm))
     if not policies:
         raise HTTPException(
             status_code=422,
             detail="No policy rules could be extracted from the document",
         )
-    return {"policies": policies}
+    return {"policies": policies, "count": len(policies)}
 
 
 @router.post("/import/confirm")

@@ -56,7 +56,7 @@ Appelé automatiquement via le webhook à chaque nouvelle transaction, ou manuel
 
 ### `POST /api/policies/import`
 
-Reçoit un PDF (base64) ou du texte brut. Gemini analyse le document et extrait les règles de politique sous forme structurée (nom de la règle, conditions, seuils, départements concernés). Retourne une preview JSON pour que l'UI puisse afficher la modale de confirmation. Sur confirmation de l'utilisateur, les règles sont insérées dans la table `policies` avec leur date de mise en vigueur.
+Reçoit un PDF (base64) ou du texte brut. Le moteur [`api/policy_import.py`](api/policy_import.py) découpe le document par sections, appelle Gemini par fragments (ou fallback regex multi-règles si `mock_llm=true` / pas de `GOOGLE_API_KEY`), et retourne **plusieurs** policies JSONB structurées (une par thème : repas, seuil d'approbation, marchands interdits, etc.) — jamais une seule policy avec le PDF entier dans `notes`. Query `mock_llm=true` pour le fallback sans API. Preview → `POST /api/policies/import/confirm` insère dans `policies`.
 
 ### `GET /api/policies` · `PATCH /api/policies/[id]` · `DELETE /api/policies/[id]`
 
