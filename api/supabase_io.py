@@ -83,10 +83,31 @@ def apply_brim_categories(df: pd.DataFrame, cat_map: dict[str, str]) -> pd.DataF
     return df
 
 
+# Card-statement lines that are NOT purchases: balance payments (CWB EFT PAYMENT),
+# point redemptions, and account fees (cash-advance / auth-user / interest charges).
+# In this dataset they are exactly the rows with no merchant category (MCC '0'/blank) —
+# the raw source transaction codes (0108 = EFT payment, 3001 = purchase, …) were not
+# loaded into Supabase, but MCC is a faithful proxy. Excluding them stops ~$1.2M of card
+# payments from corrupting spend totals, expense reports, compliance scans and budgets.
+# Real refunds keep their merchant's MCC (e.g. 5533) and are intentionally retained.
+_NON_PURCHASE_MCC = {"", "0", "00", "000", "0000", "00000", "nan", "none", "null"}
+
+
+def _drop_non_purchase_rows(tx_df: pd.DataFrame) -> pd.DataFrame:
+    if "merchant_category" not in tx_df.columns:
+        return tx_df
+    mcc = (
+        tx_df["merchant_category"].astype(str).str.strip()
+        .str.replace(r"\.0$", "", regex=True).str.lower()
+    )
+    return tx_df[~mcc.isin(_NON_PURCHASE_MCC)].copy()
+
+
 def load_transactions_frame(client) -> pd.DataFrame:
     tx_df = fetch_table(client, "transactions")
     if tx_df.empty:
         raise RuntimeError("No rows in Supabase table `transactions`")
+    tx_df = _drop_non_purchase_rows(tx_df)
     emp_df = fetch_table(client, "employees")
     dept_df = fetch_table(client, "departments")
     df = enrich_transactions(

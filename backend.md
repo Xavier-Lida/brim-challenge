@@ -39,6 +39,8 @@
 | `expense_reports`   | id, employee_id, event_group_id, title, date_from, date_to, total_amount, status, pdf_url, ai_recommendation, ai_reasoning |
 | `notifications`     | id, type **('flag' \| 'approval' \| 'decision')**, reference_id, message, read, created_at                                        |
 
+> **Hygiène des données (lignes non-achat).** Le flux de carte brut mélange des **achats** avec des **paiements de solde** (`CWB EFT PAYMENT`, code source `0108`), des **rachats de points** (`POINT REDEMPTION`) et des **frais** (`CASH ADVANCE FEE`, `AUTH USER FEE`, `CASH INTEREST CHARGE`). Ces lignes n'ont **pas de MCC** (`merchant_category = '0'`/vide) et ~−1,2 M$ de paiements fausseraient tous les totaux. `load_transactions_frame` ([`api/supabase_io.py`](api/supabase_io.py)) les **exclut** via `_drop_non_purchase_rows` (proxy MCC, car le code transaction source n'est pas chargé) — donc Features 1–4 ne voient que de vrais achats. Les **remboursements réels** (montant négatif mais MCC réel, ex. 5533) sont **conservés**.
+
 > Schéma canonique : [`supabase/schema.sql`](supabase/schema.sql) (DDL). Notes clés : `transaction_flags.weight` est un **entier 1–5** (contrainte CHECK) — l'échelle de sévérité partagée par tout le pipeline ; `policies.policy_requirements` est du **JSONB** structuré (`approval_threshold_cad`, `category_limits_cad`, `restricted_categories`, `restricted_merchants`, `notes`) — source de vérité pour Features 2 et 3 ; `notifications.type` ∈ {`flag`, `approval`, `decision`}. La table `budgets` (budget trimestriel par département) alimente le statut budgétaire de Feature 3.
 
 
