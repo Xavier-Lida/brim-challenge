@@ -110,6 +110,45 @@ BOOSTER_CODES = {"round_number", "weekend"}
 # Approved statuses -> a threshold breach that's already approved is not a violation.
 APPROVED_STATUSES = {"approved", "reimbursed", "closed", "settled"}
 
+# Stable namespace for deterministic incident_id (same pattern as feature4 event groups).
+_F2_NS = uuid.UUID("b1115204-0000-4000-8000-000000000002")
+
+# Fallback policy ids when registry lookup misses (seed policies).
+CONCERN_DEFAULT_POLICY_ID: dict[str, str] = {
+    "over_threshold": "pol-default-approval",
+    "split_purchase": "pol-default-approval",
+    "just_under_limit": "pol-default-approval",
+    "category_limit": "pol-default-meals",
+    "restricted_category": "pol-restricted-bars",
+    "restricted_merchant": "pol-restricted-bars",
+}
+
+# Match concern codes to policy registry traits when seed ids are absent.
+CONCERN_POLICY_TRAITS: dict[str, str] = {
+    "over_threshold": "has_threshold",
+    "split_purchase": "has_threshold",
+    "just_under_limit": "has_threshold",
+    "category_limit": "has_category_limits",
+    "restricted_category": "has_restricted",
+    "restricted_merchant": "has_restricted",
+}
+
+# Tie-break when multiple concerns share the same weight.
+CONCERN_PRIORITY: list[str] = [
+    "split_purchase",
+    "restricted_category",
+    "restricted_merchant",
+    "over_threshold",
+    "duplicate_charge",
+    "geo_anomaly",
+    "category_limit",
+    "just_under_limit",
+    "velocity",
+    "escalation",
+    "round_number",
+    "weekend",
+]
+
 
 # =========================================================================== #
 # Policy (structured defaults + free-text for the LLM)
@@ -162,6 +201,8 @@ def load_policy(path: str | None) -> dict[str, Any]:
         "category_limits_cad": dict(DEFAULT_POLICY["category_limits_cad"]),
         "restricted_categories": list(DEFAULT_POLICY["restricted_categories"]),
         "restricted_merchants": list(DEFAULT_POLICY["restricted_merchants"]),
+        "policy_registry": {},
+        "default_policy_id": None,
     }
     if not path:
         return policy
@@ -170,13 +211,25 @@ def load_policy(path: str | None) -> dict[str, Any]:
     names: list[str] = []
     notes: list[str] = []
     thresholds: list[float] = []
+    registry: dict[str, dict] = {}
+    default_policy_id: str | None = None
     for _, row in df.iterrows():
         if "active" in df.columns and str(row.get("active")).strip().lower() in ("false", "0", "no", "f"):
             continue
+        policy_id = str(row.get("id", "")).strip() or None
         name = str(row.get("policy_name", "")).strip()
         if name:
             names.append(name)
         rules = _parse_requirements(row.get("policy_requirements", ""))
+        if policy_id:
+            if default_policy_id is None:
+                default_policy_id = policy_id
+            registry[policy_id] = {
+                "policy_name": name or policy_id,
+                "has_threshold": rules.get("approval_threshold_cad") is not None,
+                "has_category_limits": bool(rules.get("category_limits_cad")),
+                "has_restricted": bool(rules.get("restricted_categories") or rules.get("restricted_merchants")),
+            }
         if rules.get("approval_threshold_cad") is not None:
             try:
                 thresholds.append(float(rules["approval_threshold_cad"]))
@@ -202,6 +255,8 @@ def load_policy(path: str | None) -> dict[str, Any]:
         "restricted_categories": policy["restricted_categories"],
         "restricted_merchants": policy["restricted_merchants"],
     }, ensure_ascii=False)
+    policy["policy_registry"] = registry
+    policy["default_policy_id"] = default_policy_id
     return policy
 
 
@@ -480,8 +535,314 @@ def compute_concerns(df: pd.DataFrame, policy: dict) -> dict[str, list[dict]]:
 
 
 # =========================================================================== #
-# Employee context (gives the LLM the history it needs for "repeat offender")
+# Incident groups — one flag per multi-transaction detector group
 # =========================================================================== #
+
+ROW_LEVEL_CODES = {
+    "over_threshold",
+    "category_limit",
+    "restricted_category",
+    "restricted_merchant",
+    "round_number",
+    "weekend",
+}
+
+
+def _incident_id_for(code: str, transaction_ids: list[str]) -> str:
+    key = f"{code}|" + "|".join(sorted(str(t) for t in transaction_ids))
+    return uuid.uuid5(_F2_NS, key).hex
+
+
+def _priority_rank(code: str) -> int:
+    try:
+        return CONCERN_PRIORITY.index(code)
+    except ValueError:
+        return len(CONCERN_PRIORITY)
+
+
+def _primary_transaction_id(df: pd.DataFrame, transaction_ids: list[str]) -> str:
+    by_id = {str(r["id"]): r for _, r in df.iterrows()}
+    ordered = sorted(
+        transaction_ids,
+        key=lambda tid: (
+            _parse_date(by_id[tid].get("date")) or pd.Timestamp.min,
+            tid,
+        ),
+    )
+    return ordered[0]
+
+
+def _registry_policy_for_concern(code: str, registry: dict[str, dict]) -> str | None:
+    trait = CONCERN_POLICY_TRAITS.get(code)
+    if not trait:
+        return None
+    for policy_id, meta in registry.items():
+        if meta.get(trait):
+            return policy_id
+    return None
+
+
+def resolve_policy_id(concerns: list[dict], policy: dict) -> str | None:
+    """Pick the policy_id for an incident from its concerns."""
+    registry: dict[str, dict] = policy.get("policy_registry") or {}
+    if not concerns:
+        return policy.get("default_policy_id")
+    ranked = sorted(
+        concerns,
+        key=lambda c: (-int(c["weight"]), _priority_rank(str(c["code"]))),
+    )
+    for c in ranked:
+        code = str(c["code"])
+        default_id = CONCERN_DEFAULT_POLICY_ID.get(code)
+        if default_id and default_id in registry:
+            return default_id
+        matched = _registry_policy_for_concern(code, registry)
+        if matched:
+            return matched
+    if policy.get("default_policy_id"):
+        return policy["default_policy_id"]
+    if registry:
+        return next(iter(registry))
+    return None
+
+
+def _collect_split_incidents(
+    df: pd.DataFrame, threshold: float, window_days: int,
+) -> list[dict]:
+    incidents: list[dict] = []
+    work = df.assign(_d=df["date"].map(_parse_date), _m=df["merchant_name"].map(_norm_merchant))
+    for (_emp, _m), g in work.groupby([work["employee_id"].astype(str), "_m"], dropna=False):
+        items = [(str(r["id"]), r["_d"], float(r["amount"])) for _, r in g.iterrows() if r["_d"] is not None]
+        items.sort(key=lambda x: x[1])
+        i = 0
+        while i < len(items):
+            j = i + 1
+            while j < len(items) and (items[j][1] - items[i][1]).days <= window_days:
+                j += 1
+            window = items[i:j]
+            amounts = [a for _, _, a in window]
+            if len(window) >= 2 and all(a < threshold for a in amounts) and sum(amounts) >= threshold:
+                total = round(sum(amounts), 2)
+                tids = [tid for tid, _, _ in window]
+                concern = {
+                    "code": "split_purchase",
+                    "message": (f"Possible split: {len(window)} charges totaling ${total:.2f} to the "
+                                f"same merchant within {window_days} day(s), each under the "
+                                f"${threshold:.0f} approval threshold."),
+                    "weight": SEV_SPLIT,
+                    "amount_at_risk": total,
+                }
+                incidents.append({
+                    "incident_id": _incident_id_for("split_purchase", tids),
+                    "transaction_ids": tids,
+                    "concern_code": "split_purchase",
+                    "concerns": [concern],
+                })
+                i = j
+            else:
+                i += 1
+    return incidents
+
+
+def _collect_duplicate_incidents(df: pd.DataFrame, window_days: int) -> list[dict]:
+    incidents: list[dict] = []
+    seen: set[str] = set()
+    work = df.assign(_d=df["date"].map(_parse_date), _m=df["merchant_name"].map(_norm_merchant))
+    for (_emp, _m, _amt), g in work.groupby(
+            [work["employee_id"].astype(str), "_m", work["amount"].round(2)], dropna=False):
+        items = [(str(r["id"]), r["_d"]) for _, r in g.iterrows() if r["_d"] is not None]
+        if len(items) < 2:
+            continue
+        items.sort(key=lambda x: x[1])
+        for k in range(1, len(items)):
+            if (items[k][1] - items[k - 1][1]).days <= window_days:
+                tids = sorted([items[k - 1][0], items[k][0]])
+                iid = _incident_id_for("duplicate_charge", tids)
+                if iid in seen:
+                    continue
+                seen.add(iid)
+                concern = {
+                    "code": "duplicate_charge",
+                    "message": f"Possible duplicate: identical ${float(_amt):.2f} charge to the "
+                               f"same merchant within {window_days} day(s).",
+                    "weight": SEV_DUPLICATE,
+                    "amount_at_risk": round(float(_amt), 2),
+                }
+                incidents.append({
+                    "incident_id": iid,
+                    "transaction_ids": tids,
+                    "concern_code": "duplicate_charge",
+                    "concerns": [concern],
+                })
+    return incidents
+
+
+def _collect_velocity_incidents(df: pd.DataFrame, min_count: int) -> list[dict]:
+    incidents: list[dict] = []
+    work = _with_day(df)
+    for (_emp, _day), g in work.groupby([work["employee_id"].astype(str), "_day"]):
+        if len(g) < min_count:
+            continue
+        total = round(float(g["amount"].sum()), 2)
+        n = len(g)
+        tids = [str(r["id"]) for _, r in g.iterrows()]
+        concern = {
+            "code": "velocity",
+            "message": (f"High purchase velocity: {n} separate charges totaling ${total:.2f} by the "
+                        f"same employee on {_day} — unusually concentrated activity."),
+            "weight": SEV_VELOCITY,
+            "amount_at_risk": total,
+        }
+        incidents.append({
+            "incident_id": _incident_id_for("velocity", tids),
+            "transaction_ids": tids,
+            "concern_code": "velocity",
+            "concerns": [concern],
+        })
+    return incidents
+
+
+def _collect_geo_incidents(df: pd.DataFrame, min_cities: int) -> list[dict]:
+    incidents: list[dict] = []
+    if "city" not in df.columns:
+        return incidents
+    work = _with_day(df)
+    for (_emp, _day), g in work.groupby([work["employee_id"].astype(str), "_day"]):
+        cities = sorted({str(c).strip() for c in g["city"].tolist() if str(c).strip()})
+        if len(cities) < min_cities:
+            continue
+        joined = ", ".join(cities)
+        tids = [str(r["id"]) for _, r in g.iterrows()]
+        concern = {
+            "code": "geo_anomaly",
+            "message": (f"Geographic anomaly: charges in {len(cities)} different cities ({joined}) by "
+                        f"the same employee on {_day} — physically implausible in one day."),
+            "weight": SEV_GEO,
+            "amount_at_risk": round(float(g["amount"].sum()), 2),
+        }
+        incidents.append({
+            "incident_id": _incident_id_for("geo_anomaly", tids),
+            "transaction_ids": tids,
+            "concern_code": "geo_anomaly",
+            "concerns": [concern],
+        })
+    return incidents
+
+
+def _collect_escalation_incidents(df: pd.DataFrame, min_count: int) -> list[dict]:
+    incidents: list[dict] = []
+    work = df.assign(_d=df["date"].map(_parse_date), _m=df["merchant_name"].map(_norm_merchant))
+    for (_emp, _m), g in work.groupby([work["employee_id"].astype(str), "_m"], dropna=False):
+        items = [(str(r["id"]), r["_d"], float(r["amount"])) for _, r in g.iterrows() if r["_d"] is not None]
+        if len(items) < min_count:
+            continue
+        items.sort(key=lambda x: x[1])
+        display = next((str(r["merchant_name"]) for _, r in g.iterrows()
+                        if str(r.get("merchant_name") or "").strip()), _m)
+        run = [items[0]]
+        best: list[tuple] = []
+        for cur in items[1:]:
+            if cur[2] > run[-1][2]:
+                run.append(cur)
+            else:
+                best = run if len(run) > len(best) else best
+                run = [cur]
+        best = run if len(run) > len(best) else best
+        if len(best) < min_count:
+            continue
+        first_amt, last_amt = best[0][2], best[-1][2]
+        tids = [tid for tid, _, _ in best]
+        concern = {
+            "code": "escalation",
+            "message": (f"Escalating charges at {display}: {len(best)} successive amounts climbing "
+                        f"from ${first_amt:.2f} to ${last_amt:.2f}."),
+            "weight": SEV_ESCALATION,
+            "amount_at_risk": round(last_amt - first_amt, 2),
+        }
+        incidents.append({
+            "incident_id": _incident_id_for("escalation", tids),
+            "transaction_ids": tids,
+            "concern_code": "escalation",
+            "concerns": [concern],
+        })
+    return incidents
+
+
+def _collect_just_under_incidents(
+    df: pd.DataFrame, policy: dict, margin: float, min_count: int,
+) -> list[dict]:
+    incidents: list[dict] = []
+    limits = policy.get("category_limits_cad") or {}
+    if not limits or "brim_category" not in df.columns:
+        return incidents
+    for (_emp, _cat), g in df.groupby(
+            [df["employee_id"].astype(str), df["brim_category"].astype(str)], dropna=False):
+        raw_limit = limits.get(_cat)
+        if raw_limit is None:
+            continue
+        try:
+            limit = float(raw_limit)
+        except (TypeError, ValueError):
+            continue
+        lower = limit * (1.0 - margin)
+        hits = [(str(r["id"]), float(r["amount"])) for _, r in g.iterrows()
+                if lower <= float(r["amount"]) < limit]
+        if len(hits) < min_count:
+            continue
+        tids = [tid for tid, _ in hits]
+        concern = {
+            "code": "just_under_limit",
+            "message": (f"Repeated charges just under the ${limit:.0f} {_cat} limit: {len(hits)} "
+                        f"charges within {int(margin * 100)}% of the cap."),
+            "weight": SEV_JUST_UNDER,
+            "amount_at_risk": round(sum(a for _, a in hits), 2),
+        }
+        incidents.append({
+            "incident_id": _incident_id_for("just_under_limit", tids),
+            "transaction_ids": tids,
+            "concern_code": "just_under_limit",
+            "concerns": [concern],
+        })
+    return incidents
+
+
+def _collect_row_incidents(
+    df: pd.DataFrame, policy: dict, concerns: dict[str, list[dict]],
+) -> list[dict]:
+    incidents: list[dict] = []
+    for tid, cs in concerns.items():
+        for c in cs:
+            if c["code"] not in ROW_LEVEL_CODES:
+                continue
+            incidents.append({
+                "incident_id": _incident_id_for(str(c["code"]), [tid]),
+                "transaction_ids": [tid],
+                "concern_code": str(c["code"]),
+                "concerns": [c],
+            })
+    return incidents
+
+
+def compute_incident_groups(
+    df: pd.DataFrame, policy: dict, concerns: dict[str, list[dict]],
+) -> list[dict]:
+    """Build one incident per detector group; row-level codes stay per (code, transaction)."""
+    incidents: list[dict] = []
+    threshold = policy["approval_threshold_cad"]
+    incidents.extend(_collect_split_incidents(df, threshold, SPLIT_WINDOW_DAYS))
+    incidents.extend(_collect_duplicate_incidents(df, DUPLICATE_WINDOW_DAYS))
+    incidents.extend(_collect_velocity_incidents(df, VELOCITY_MIN_SAME_DAY))
+    incidents.extend(_collect_geo_incidents(df, GEO_MIN_DISTINCT_CITIES))
+    incidents.extend(_collect_escalation_incidents(df, ESCALATION_MIN_COUNT))
+    incidents.extend(_collect_just_under_incidents(
+        df, policy, JUST_UNDER_MARGIN, JUST_UNDER_MIN_COUNT,
+    ))
+    incidents.extend(_collect_row_incidents(df, policy, concerns))
+
+    for inc in incidents:
+        inc["policy_id"] = resolve_policy_id(inc["concerns"], policy)
+    return incidents
+
 
 def build_employee_context(df: pd.DataFrame, candidates_by_emp: dict[str, int]) -> dict[str, dict]:
     ctx: dict[str, dict] = {}
@@ -632,55 +993,91 @@ def _severity_band(w: int) -> str:
     return "high" if w >= HIGH_SEVERITY else ("medium" if w >= 2 else "low")
 
 
-def build_outputs(df: pd.DataFrame, verdicts: dict[str, dict], policy: dict) -> dict:
+def build_outputs(
+    df: pd.DataFrame,
+    verdicts: dict[str, dict],
+    policy: dict,
+    incidents: list[dict],
+) -> dict:
     by_id = {str(r["id"]): r for _, r in df.iterrows()}
     flags: list[dict] = []
     strikes: list[dict] = []
     notifications: list[dict] = []
     offenders: dict[str, dict] = defaultdict(lambda: {"flag_count": 0, "amount_cheated": 0.0, "max_weight": 0.0})
+    seen_incidents: set[str] = set()
 
-    for tid, v in verdicts.items():
-        if not v["is_violation"]:
+    for inc in incidents:
+        iid = str(inc["incident_id"])
+        if iid in seen_incidents:
             continue
-        r = by_id[tid]
-        emp = str(r["employee_id"])
-        weight = v["weight"]
-        band = _severity_band(weight)
-        # Sum the transaction's OWN amount (not the split's group total) so feature4,
-        # which sums amount_cheated across strikes, doesn't double-count siblings.
-        own_amount = round(float(r["amount"]), 2)
+        seen_incidents.add(iid)
 
-        flags.append({   # exactly the insertable transaction_flags columns
-            "transaction_id": tid,
-            "warning_message": v["warning_message"],
+        tids = [str(t) for t in inc["transaction_ids"]]
+        group_verdicts = [verdicts[t] for t in tids if t in verdicts and verdicts[t].get("is_violation")]
+        if not group_verdicts:
+            continue
+
+        weight = max(int(v["weight"]) for v in group_verdicts)
+        concern_msgs = list(dict.fromkeys(c["message"] for c in inc["concerns"]))
+        primary_tid = _primary_transaction_id(df, tids)
+        primary_v = verdicts.get(primary_tid)
+        if primary_v and primary_v.get("is_violation"):
+            pv = str(primary_v.get("warning_message", "")).strip()
+            warning_message = pv if pv else "; ".join(concern_msgs)
+        else:
+            warning_message = "; ".join(concern_msgs)
+
+        related = sorted(tids, key=lambda tid: (
+            _parse_date(by_id[tid].get("date")) or pd.Timestamp.min,
+            tid,
+        ))
+        band = _severity_band(weight)
+        policy_id = inc.get("policy_id") or resolve_policy_id(inc["concerns"], policy)
+
+        flags.append({
+            "transaction_id": primary_tid,
+            "warning_message": warning_message,
             "weight": weight,
+            "policy_id": policy_id,
+            "incident_id": iid,
+            "related_transaction_ids": related,
         })
-        notifications.append({   # notifications.type CHECK IN ('flag','approval'); id has no default
+        notifications.append({
             "id": uuid.uuid4().hex,
             "type": "flag",
-            "reference_id": tid,
-            "message": f"[{band.upper()}] {v['warning_message']}",
+            "reference_id": primary_tid,
+            "message": f"[{band.upper()}] {warning_message}",
             "read": False,
         })
 
-        o = offenders[emp]
-        o["flag_count"] += 1
-        o["amount_cheated"] = round(o["amount_cheated"] + own_amount, 2)
-        o["max_weight"] = max(o["max_weight"], weight)
+        for tid in tids:
+            if tid not in by_id:
+                continue
+            r = by_id[tid]
+            emp = str(r["employee_id"])
+            own_amount = round(float(r["amount"]), 2)
+            v = verdicts.get(tid)
+            if not v or not v.get("is_violation"):
+                continue
 
-        if weight >= HIGH_SEVERITY:   # serious violation -> a strike (repeat offenders accumulate)
-            strikes.append({
-                "employee_id": emp,
-                "strike_description": v["warning_message"],
-                "strike_date": str(r.get("date"))[:10] or None,
-                "amount_cheated": own_amount,
-            })
+            o = offenders[emp]
+            if tid == primary_tid:
+                o["flag_count"] += 1
+            o["amount_cheated"] = round(o["amount_cheated"] + own_amount, 2)
+            o["max_weight"] = max(o["max_weight"], int(v["weight"]))
+
+            if int(v["weight"]) >= HIGH_SEVERITY:
+                strikes.append({
+                    "employee_id": emp,
+                    "strike_description": warning_message,
+                    "strike_date": str(r.get("date"))[:10] or None,
+                    "amount_cheated": own_amount,
+                })
 
     # rank repeat offenders by recidivism then severity then dollars
     ranked = []
     for emp, o in offenders.items():
-        r0 = next((by_id[t] for t, v in verdicts.items()
-                   if v["is_violation"] and str(by_id[t]["employee_id"]) == emp), None)
+        r0 = next((by_id[t] for t in by_id if str(by_id[t]["employee_id"]) == emp), None)
         ranked.append({
             "employee_id": emp,
             "employee_name": (r0.get("employee_name") if r0 is not None else None),
@@ -714,6 +1111,7 @@ def build_outputs(df: pd.DataFrame, verdicts: dict[str, dict], policy: dict) -> 
 
 def run(df: pd.DataFrame, policy: dict, use_llm: bool) -> dict:
     concerns = compute_concerns(df, policy)
+    incidents = compute_incident_groups(df, policy, concerns)
     candidates_by_emp: dict[str, int] = defaultdict(int)
     id_to_emp = {str(r["id"]): str(r["employee_id"]) for _, r in df.iterrows()}
     for tid, cs in concerns.items():
@@ -721,9 +1119,10 @@ def run(df: pd.DataFrame, policy: dict, use_llm: bool) -> dict:
             candidates_by_emp[id_to_emp.get(tid, "?")] += 1
     emp_ctx = build_employee_context(df, candidates_by_emp)
     verdicts = scan(df, concerns, policy, emp_ctx, use_llm)
-    out = build_outputs(df, verdicts, policy)
+    out = build_outputs(df, verdicts, policy, incidents)
     print(f"[scan: {sum(1 for c in concerns.values() if c)} candidates, "
-          f"{len(out['transaction_flags'])} flags, {len(out['employee_strikes'])} strikes]", file=sys.stderr)
+          f"{len(incidents)} incidents, {len(out['transaction_flags'])} flags, "
+          f"{len(out['employee_strikes'])} strikes]", file=sys.stderr)
     return out
 
 

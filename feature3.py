@@ -435,37 +435,55 @@ def send_email_resend(payload: dict, from_addr: str) -> bool:
 def build_pipeline(df: pd.DataFrame, flags: dict, strikes: dict, budgets: dict,
                    threshold: float, approver_to: str, use_llm: bool,
                    active_policies: list[dict] | None = None,
+                   incidents: list[dict] | None = None,
                    ) -> tuple[list[dict], list[dict], list[dict]]:
+    """Approval requests are generated from the flags found: one request per flag
+    incident, keyed on the incident's primary transaction. Incidents sharing the
+    same primary transaction are merged (UNIQUE(transaction_id) on approval_requests)."""
     from api.policy_checks import evaluate_policy_checks
 
     dept_spend = department_spend(df)
     policies = active_policies or []
+    incidents = incidents or []
+    rows_by_id = {str(r["id"]): r for _, r in df.iterrows()}
+
+    # Group incidents by their primary transaction so each transaction yields at most
+    # one approval request (matches the table's UNIQUE(transaction_id) constraint).
+    by_primary: dict[str, list[dict]] = defaultdict(list)
+    for inc in incidents:
+        by_primary[str(inc["transaction_id"])].append(inc)
 
     notifications: list[dict] = []
-    seen_flag_tx: set[str] = set()
     approval_requests: list[dict] = []
 
-    for _, row in df.iterrows():
-        tid = str(row["id"])
-        tx_flags = flags.get(tid, [])
-
-        # Flag notification (sidebar badge + flag list) for every flagged transaction.
-        if tx_flags and tid not in seen_flag_tx:
-            seen_flag_tx.add(tid)
-            max_w = max(f["weight"] for f in tx_flags)
-            msg = tx_flags[0]["warning_message"] or "Transaction signalée par le moteur de conformité."
-            notifications.append({
-                "id": _notification_id("flag", tid),
-                "type": "flag",
-                "reference_id": tid,
-                "message": f"Transaction signalée ({_cad(float(row['amount']))}) : {msg}",
-                "read": False,
-                "created_at": _now_iso(),
-                "_weight": max_w,
-            })
-
-        if not needs_approval(row, tx_flags, threshold):
+    for tid, tid_incidents in by_primary.items():
+        row = rows_by_id.get(tid)
+        if row is None:
             continue
+
+        # All flags touching this transaction give the approver the full picture.
+        tx_flags = flags.get(tid, [])
+        max_w = max(
+            (f["weight"] for f in tx_flags),
+            default=max((inc["weight"] for inc in tid_incidents), default=0.0),
+        )
+        incident_ids = [inc["incident_id"] for inc in tid_incidents if inc.get("incident_id")]
+        policy_ids = [inc["policy_id"] for inc in tid_incidents if inc.get("policy_id")]
+
+        # One flag notification per incident's primary transaction.
+        primary_msg = (
+            tx_flags[0]["warning_message"] if tx_flags
+            else tid_incidents[0].get("warning_message")
+        ) or "Transaction signalée par le moteur de conformité."
+        notifications.append({
+            "id": _notification_id("flag", tid),
+            "type": "flag",
+            "reference_id": tid,
+            "message": f"Transaction signalée ({_cad(float(row['amount']))}) : {primary_msg}",
+            "read": False,
+            "created_at": _now_iso(),
+            "_weight": max_w,
+        })
 
         req_id = _approval_id(tid)
         emp_id = str(row["employee_id"])
@@ -477,6 +495,8 @@ def build_pipeline(df: pd.DataFrame, flags: dict, strikes: dict, budgets: dict,
             "spend_history": spend_history(df, row),
             "warnings": tx_flags,
             "strike_history": strikes.get(emp_id),
+            "incident_ids": incident_ids,
+            "policy_ids": policy_ids,
         }
         approval_requests.append({
             "id": req_id,

@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from api.deps import supabase_client
 from api.supabase_io import (
     apply_simple_decision,
+    flag_incidents_from_db,
     list_approvals_enriched,
     load_active_policies_list,
     load_active_policy,
@@ -59,16 +60,17 @@ def run_approvals_pipeline(
 
     df, flags, strikes, budgets = load_all_from_supabase(client)
     active_policies = load_active_policies_list(client)
+    incidents = flag_incidents_from_db(client)
     try:
         approval_requests, notifications, emails = build_pipeline(
             df, flags, strikes, budgets, effective_threshold, approver_to, use_llm,
-            active_policies=active_policies,
+            active_policies=active_policies, incidents=incidents,
         )
         mode = "llm" if use_llm else "mock"
     except Exception as exc:  # noqa: BLE001
         approval_requests, notifications, emails = build_pipeline(
             df, flags, strikes, budgets, effective_threshold, approver_to, use_llm=False,
-            active_policies=active_policies,
+            active_policies=active_policies, incidents=incidents,
         )
         mode = f"mock (fallback: {exc})"
 

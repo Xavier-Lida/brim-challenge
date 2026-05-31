@@ -141,6 +141,8 @@ def load_policy_from_dataframe(policies_df: pd.DataFrame) -> dict[str, Any]:
             "category_limits_cad": dict(DEFAULT_POLICY["category_limits_cad"]),
             "restricted_categories": list(DEFAULT_POLICY["restricted_categories"]),
             "restricted_merchants": list(DEFAULT_POLICY["restricted_merchants"]),
+            "policy_registry": {},
+            "default_policy_id": None,
         }
     # With active policies present, derive limits/restrictions ONLY from them — never
     # inject DEFAULT_POLICY's hardcoded meal caps (e.g. $75/$250) that the imported
@@ -150,20 +152,36 @@ def load_policy_from_dataframe(policies_df: pd.DataFrame) -> dict[str, Any]:
         "category_limits_cad": {},
         "restricted_categories": [],
         "restricted_merchants": [],
+        "policy_registry": {},
+        "default_policy_id": None,
     }
 
     names: list[str] = []
     notes: list[str] = []
     thresholds: list[float] = []
+    registry: dict[str, dict] = {}
+    default_policy_id: str | None = None
     for _, row in policies_df.iterrows():
         if "active" in policies_df.columns:
             active_val = str(row.get("active", "")).strip().lower()
             if active_val in ("false", "0", "no", "f"):
                 continue
+        policy_id = str(row.get("id", "")).strip() or None
         name = str(row.get("policy_name", "")).strip()
         if name:
             names.append(name)
         rules = _parse_requirements(row.get("policy_requirements", ""))
+        if policy_id:
+            if default_policy_id is None:
+                default_policy_id = policy_id
+            registry[policy_id] = {
+                "policy_name": name or policy_id,
+                "has_threshold": rules.get("approval_threshold_cad") is not None,
+                "has_category_limits": bool(rules.get("category_limits_cad")),
+                "has_restricted": bool(
+                    rules.get("restricted_categories") or rules.get("restricted_merchants")
+                ),
+            }
         if rules.get("approval_threshold_cad") is not None:
             try:
                 thresholds.append(float(rules["approval_threshold_cad"]))
@@ -196,6 +214,8 @@ def load_policy_from_dataframe(policies_df: pd.DataFrame) -> dict[str, Any]:
         },
         ensure_ascii=False,
     )
+    policy["policy_registry"] = registry
+    policy["default_policy_id"] = default_policy_id
     return policy
 
 
@@ -256,6 +276,50 @@ def compute_policy_checks_for_transaction(client, transaction_id: str) -> list[d
 def flags_dict_from_db(client) -> dict[str, list[dict]]:
     flags_df = fetch_table(client, "transaction_flags")
     return flags_from_df(flags_df) if not flags_df.empty else {}
+
+
+def _normalize_related_ids(value, primary: str) -> list[str]:
+    """transaction_flags.related_transaction_ids may be None / str / list."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        related = [primary]
+    elif isinstance(value, (list, tuple)):
+        related = [str(t) for t in value]
+    else:
+        related = [str(value)]
+    if primary not in related:
+        related = [primary, *related]
+    return sorted(set(related))
+
+
+def flag_incidents_from_db(client) -> list[dict]:
+    """One incident per transaction_flags row (the engine writes one flag per incident).
+
+    Returns dicts with the primary transaction, the full related set, and the policy
+    so the approval pipeline can be driven directly by the flags that were found.
+    """
+    flags_df = fetch_table(client, "transaction_flags")
+    if flags_df.empty:
+        return []
+    incidents: list[dict] = []
+    for _, r in flags_df.iterrows():
+        primary = str(r["transaction_id"])
+        policy_id = r.get("policy_id")
+        policy_id_str = (
+            str(policy_id).strip()
+            if policy_id is not None and not (isinstance(policy_id, float) and pd.isna(policy_id))
+            else None
+        )
+        incidents.append({
+            "incident_id": str(r["incident_id"]) if pd.notna(r.get("incident_id")) else None,
+            "transaction_id": primary,
+            "related_transaction_ids": _normalize_related_ids(
+                r.get("related_transaction_ids"), primary
+            ),
+            "policy_id": policy_id_str,
+            "weight": float(pd.to_numeric(r.get("weight"), errors="coerce") or 0.0),
+            "warning_message": str(r.get("warning_message", "")),
+        })
+    return incidents
 
 
 def strikes_dict_from_db(client) -> dict[str, dict]:
@@ -477,16 +541,43 @@ def employee_name_map(client) -> dict[str, str]:
 def flag_counts_for_transactions(client, transaction_ids: list[str]) -> dict[str, int]:
     if not transaction_ids:
         return {}
+    id_set = set(transaction_ids)
     counts: dict[str, int] = defaultdict(int)
     for chunk in _chunked(transaction_ids):
         res = (
             client.table("transaction_flags")
-            .select("transaction_id")
+            .select("transaction_id, related_transaction_ids")
             .in_("transaction_id", chunk)
             .execute()
         )
+        seen_rows = {(str(r.get("transaction_id")), tuple(r.get("related_transaction_ids") or []))
+                     for r in (res.data or [])}
         for row in res.data or []:
-            counts[str(row["transaction_id"])] += 1
+            related = row.get("related_transaction_ids") or []
+            if isinstance(related, str):
+                related = [related]
+            tids = set(str(t) for t in related) | {str(row["transaction_id"])}
+            for tid in tids:
+                if tid in id_set:
+                    counts[tid] += 1
+
+        overlap_res = (
+            client.table("transaction_flags")
+            .select("transaction_id, related_transaction_ids")
+            .overlaps("related_transaction_ids", chunk)
+            .execute()
+        )
+        for row in overlap_res.data or []:
+            key = (str(row.get("transaction_id")), tuple(row.get("related_transaction_ids") or []))
+            if key in seen_rows:
+                continue
+            related = row.get("related_transaction_ids") or []
+            if isinstance(related, str):
+                related = [related]
+            tids = set(str(t) for t in related) | {str(row["transaction_id"])}
+            for tid in tids:
+                if tid in id_set:
+                    counts[tid] += 1
     return dict(counts)
 
 
@@ -539,13 +630,18 @@ def list_flags_enriched(client) -> list[dict]:
 
     tx_df = fetch_table(client, "transactions")
     emp_df = fetch_table(client, "employees")
-    dept_df = fetch_table(client, "departments")
+    pol_df = fetch_table(client, "policies")
 
     emp_names: dict[str, str] = {}
     if not emp_df.empty:
         for _, r in emp_df.iterrows():
             parts = [str(r.get(c, "")).strip() for c in ("first_name", "last_name") if c in emp_df.columns]
             emp_names[str(r["id"])] = " ".join(p for p in parts if p).strip()
+
+    policy_names: dict[str, str] = {}
+    if not pol_df.empty:
+        for _, r in pol_df.iterrows():
+            policy_names[str(r["id"])] = str(r.get("policy_name", r["id"]))
 
     tx_by_id: dict[str, dict] = {}
     for _, r in tx_df.iterrows():
@@ -566,21 +662,57 @@ def list_flags_enriched(client) -> list[dict]:
 
     flag_counts: dict[str, int] = defaultdict(int)
     for _, r in flags_df.iterrows():
-        flag_counts[str(r["transaction_id"])] += 1
+        primary = str(r["transaction_id"])
+        related_raw = r.get("related_transaction_ids")
+        if related_raw is None or (isinstance(related_raw, float) and pd.isna(related_raw)):
+            related = [primary]
+        elif isinstance(related_raw, (list, tuple)):
+            related = [str(t) for t in related_raw]
+        else:
+            related = [str(related_raw)]
+        for tid in set(related) | {primary}:
+            flag_counts[tid] += 1
+
+    def _enrich_tx(tid: str) -> dict | None:
+        tx = tx_by_id.get(tid)
+        if not tx:
+            return None
+        return {**tx, "flag_count": flag_counts.get(tid, 0)}
 
     out: list[dict] = []
     for _, r in flags_df.iterrows():
         tid = str(r["transaction_id"])
-        tx = tx_by_id.get(tid)
+        tx = _enrich_tx(tid)
         reviewed = bool(r.get("reviewed", False))
+        related_raw = r.get("related_transaction_ids")
+        if related_raw is None or (isinstance(related_raw, float) and pd.isna(related_raw)):
+            related_ids = [tid]
+        elif isinstance(related_raw, (list, tuple)):
+            related_ids = [str(t) for t in related_raw]
+        else:
+            related_ids = [str(related_raw)]
+        if tid not in related_ids:
+            related_ids = [tid, *related_ids]
+        related_ids = sorted(set(related_ids))
+        policy_id = r.get("policy_id")
+        policy_id_str = str(policy_id).strip() if policy_id is not None and not (
+            isinstance(policy_id, float) and pd.isna(policy_id)
+        ) else None
         out.append({
             "id": str(r["id"]),
             "transaction_id": tid,
             "warning_message": str(r.get("warning_message", "")),
             "weight": int(r.get("weight", 1)),
             "reviewed": reviewed,
+            "policy_id": policy_id_str,
+            "policy_name": policy_names.get(policy_id_str, policy_id_str) if policy_id_str else None,
+            "incident_id": str(r.get("incident_id", "")) or None,
+            "related_transaction_ids": related_ids,
+            "related_transactions": [
+                t for t in (_enrich_tx(rt) for rt in related_ids) if t is not None
+            ],
             "employee_name": tx["employee_name"] if tx else None,
-            "transaction": {**tx, "flag_count": flag_counts[tid]} if tx else None,
+            "transaction": tx,
         })
     out.sort(key=lambda x: (-x["weight"], x["reviewed"]))
     return out
@@ -598,6 +730,7 @@ def list_approvals_enriched(client) -> list[dict]:
     df, flags, strikes, budgets = load_all_from_supabase(client)
     dept_spend = department_spend(df)
     active_policies = load_active_policies_list(client)
+    policy_names = {str(p.get("id")): str(p.get("policy_name") or p.get("id")) for p in active_policies}
 
     # Precompute O(1) lookups once instead of scanning df per approval request.
     tx_by_id: dict[str, pd.Series] = {str(r["id"]): r for _, r in df.iterrows()}
@@ -633,6 +766,21 @@ def list_approvals_enriched(client) -> list[dict]:
             if not policy_checks:
                 policy_checks = evaluate_policy_checks(row, active_policies, budget=budget)
 
+        # The flags that triggered this approval (the request was generated from them).
+        tx_flags = flags.get(tid, [])
+        approval_flags = [
+            {
+                "warning_message": str(f.get("warning_message", "")),
+                "weight": int(float(f.get("weight") or 0)),
+                "policy_id": f.get("policy_id"),
+                "policy_name": policy_names.get(str(f.get("policy_id"))) if f.get("policy_id") else None,
+                "incident_id": f.get("incident_id"),
+            }
+            for f in tx_flags
+        ]
+        primary_policy_id = next((f.get("policy_id") for f in tx_flags if f.get("policy_id")), None)
+        primary_incident_id = next((f.get("incident_id") for f in tx_flags if f.get("incident_id")), None)
+
         out.append({
             "id": str(req["id"]),
             "transaction_id": tid,
@@ -644,6 +792,10 @@ def list_approvals_enriched(client) -> list[dict]:
                 str(row["department"]) if pd.notna(row.get("department")) else "Unknown"
             ),
             "amount": float(req.get("amount", row["amount"])),
+            "merchant_name": str(row.get("merchant_name", "")),
+            "transaction_date": str(row.get("date", ""))[:10],
+            "merchant_category": str(row.get("brim_category") or ""),
+            "city": str(row.get("city") or ""),
             "reason": str(req.get("reason", "")),
             "ai_recommendation": str(req.get("ai_recommendation") or "review"),
             "ai_reasoning": str(req.get("ai_reasoning") or ""),
@@ -653,6 +805,10 @@ def list_approvals_enriched(client) -> list[dict]:
             "policy_checks": policy_checks,
             # One combined string covering EVERY failed policy (frontend "all-in-one" error).
             "policy_violation_summary": format_all_policy_violations(policy_checks),
+            # The originating flags (approval is generated from the flags found).
+            "flags": approval_flags,
+            "incident_id": primary_incident_id,
+            "policy_id": primary_policy_id,
         })
     return out
 

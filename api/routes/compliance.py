@@ -17,6 +17,7 @@ def scan_compliance(
     mock_llm: bool = Query(False, alias="mock_llm"),
     limit: int | None = Query(None, ge=1),
     replace: bool = Query(True, description="Replace prior flags for scanned transactions"),
+    employee_id: str | None = Query(None, description="Scan only this employee's transactions"),
     client=Depends(supabase_client),
 ) -> dict[str, Any]:
     return execute_compliance_scan(
@@ -24,4 +25,5 @@ def scan_compliance(
         mock_llm=mock_llm,
         limit=limit,
         replace=replace,
+        employee_id=employee_id,
     )

@@ -70,6 +70,21 @@ def validate_policy_checks(payload) -> tuple[bool, str]:
     return True, f"{len(checks)} policy check(s)"
 
 
+def validate_flags(payload) -> tuple[bool, str]:
+    if not isinstance(payload, list):
+        return False, "flags response is not a list"
+    if not payload:
+        return True, "no flags (empty ok)"
+    sample = payload[0]
+    for key in ("policy_id", "incident_id", "related_transaction_ids"):
+        if key not in sample:
+            return False, f"flag missing {key}"
+    related = sample.get("related_transaction_ids")
+    if not isinstance(related, list) or not related:
+        return False, "related_transaction_ids must be a non-empty list"
+    return True, f"flags ok (sample has {len(related)} related txn(s))"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://149.28.43.72")
@@ -97,6 +112,7 @@ def main() -> int:
 
     failures = 0
     approvals_payload = None
+    flags_payload = None
     for name, method, path, params, body in checks:
         status, payload, dt = call(args.base, method, path, params=params, body=body)
         ok = status is not None and 200 <= status < 300
@@ -104,6 +120,8 @@ def main() -> int:
             failures += 1
         if name == "F3 approvals list" and ok:
             approvals_payload = payload
+        if name == "flags" and ok:
+            flags_payload = payload
         tag = OK if ok else FAIL
         print(f"{tag} {name:22} {str(status):>4}  {dt:5.1f}s  {summarize(payload)}")
 
@@ -113,6 +131,13 @@ def main() -> int:
             failures += 1
         tag = OK if ok else FAIL
         print(f"{tag} {'policy_checks':22} {'':>4}        {detail}")
+
+    if flags_payload is not None:
+        ok, detail = validate_flags(flags_payload)
+        if not ok:
+            failures += 1
+        tag = OK if ok else FAIL
+        print(f"{tag} {'flag_incidents':22} {'':>4}        {detail}")
 
     print("-" * 64)
     print(f"{'ALL PASSED' if not failures else str(failures) + ' FAILED'}\n")

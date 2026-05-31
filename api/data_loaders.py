@@ -98,10 +98,21 @@ def flags_from_df(df: pd.DataFrame) -> dict[str, list[dict]]:
     flags: dict[str, list[dict]] = defaultdict(list)
     for _, r in df.iterrows():
         tid = str(r["transaction_id"])
-        flags[tid].append({
+        related_raw = r.get("related_transaction_ids")
+        if related_raw is None or (isinstance(related_raw, float) and pd.isna(related_raw)):
+            related = [tid]
+        elif isinstance(related_raw, (list, tuple)):
+            related = [str(t) for t in related_raw]
+        else:
+            related = [str(related_raw)]
+        entry = {
             "warning_message": str(r.get("warning_message", "")),
             "weight": float(pd.to_numeric(r.get("weight"), errors="coerce") or 0.0),
-        })
+            "policy_id": str(r["policy_id"]) if pd.notna(r.get("policy_id")) else None,
+            "incident_id": str(r["incident_id"]) if pd.notna(r.get("incident_id")) else None,
+        }
+        for rt in set(related) | {tid}:
+            flags[str(rt)].append(entry)
     return flags
 
 

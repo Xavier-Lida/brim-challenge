@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from api.deps import supabase_client
 from api.routes.approvals import _policy_threshold
 from api.supabase_io import (
+    flag_incidents_from_db,
     flags_dict_from_db,
     load_active_policies_list,
     load_active_policy,
@@ -93,13 +94,19 @@ def handle_supabase_webhook(
         df_all, flags, strikes, budgets = load_all_from_supabase(client)
         threshold = _policy_threshold(client)
         approver_to = os.getenv("APPROVER_EMAIL", "approver@company.com")
-        row_mask = df_all["id"].astype(str) == transaction_id
-        approval_df = df_all[row_mask]
-        if not approval_df.empty:
+        # Approvals are driven by the flags found: keep only incidents that involve
+        # the just-inserted transaction (as primary or related).
+        incidents = [
+            inc for inc in flag_incidents_from_db(client)
+            if transaction_id in {inc["transaction_id"], *inc["related_transaction_ids"]}
+        ]
+        if incidents:
             active_policies = load_active_policies_list(client)
+            # Pass the full frame so build_pipeline can resolve each incident's primary
+            # transaction (it may differ from the inserted one); incidents scope the work.
             approval_requests, notifications, _emails = build_pipeline(
-                approval_df, flags, strikes, budgets, threshold, approver_to, use_llm=False,
-                active_policies=active_policies,
+                df_all, flags, strikes, budgets, threshold, approver_to, use_llm=False,
+                active_policies=active_policies, incidents=incidents,
             )
             persist_pipeline_to_supabase(client, approval_requests, notifications)
             results["steps"].append({
