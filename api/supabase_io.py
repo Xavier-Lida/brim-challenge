@@ -208,6 +208,51 @@ def load_active_policy(client) -> dict[str, Any]:
     return load_policy_from_dataframe(pol_df)
 
 
+def load_active_policies_list(client) -> list[dict]:
+    """Active policy rows (not merged), stable order: effective_date DESC, id ASC."""
+    records = list_policies(client)
+    active = [
+        r for r in records
+        if str(r.get("active", True)).strip().lower() not in ("false", "0", "no", "f")
+    ]
+    active.sort(key=lambda p: str(p.get("id") or ""))
+    active.sort(key=lambda p: str(p.get("effective_date") or ""), reverse=True)
+    return active
+
+
+def _policy_checks_from_row(req: pd.Series) -> list[dict]:
+    raw = req.get("policy_checks")
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    if isinstance(raw, list) and raw:
+        return list(raw)
+    return []
+
+
+def compute_policy_checks_for_transaction(client, transaction_id: str) -> list[dict]:
+    """Evaluate the active policies against a single transaction (for decision snapshots)."""
+    from api.policy_checks import evaluate_policy_checks
+    from feature3 import budget_status, department_spend
+
+    policies = load_active_policies_list(client)
+    df = load_transactions_frame(client)
+    if df.empty:
+        return []
+    match = df[df["id"].astype(str) == str(transaction_id)]
+    if match.empty:
+        return []
+    row = match.iloc[0]
+    budgets_df = fetch_table(client, "budgets")
+    budgets = budgets_from_df(budgets_df) if not budgets_df.empty else {}
+    budget = budget_status(row, budgets, department_spend(df))
+    return evaluate_policy_checks(row, policies, budget=budget)
+
+
 def flags_dict_from_db(client) -> dict[str, list[dict]]:
     flags_df = fetch_table(client, "transaction_flags")
     return flags_from_df(flags_df) if not flags_df.empty else {}
@@ -302,7 +347,11 @@ def persist_compliance_output(
 def persist_pipeline_to_supabase(client, approval_requests: list[dict], notifications: list[dict]) -> None:
     reqs = [{k: v for k, v in r.items() if not k.startswith("_")} for r in approval_requests]
     if reqs:
-        client.table("approval_requests").upsert(reqs, on_conflict="id").execute()
+        try:
+            client.table("approval_requests").upsert(reqs, on_conflict="id").execute()
+        except Exception:  # noqa: BLE001 — policy_checks column absent (PGRST204) -> retry without it
+            stripped = [{k: v for k, v in r.items() if k != "policy_checks"} for r in reqs]
+            client.table("approval_requests").upsert(stripped, on_conflict="id").execute()
     if notifications:
         client.table("notifications").upsert(notifications, on_conflict="id").execute()
 
@@ -350,11 +399,19 @@ def apply_simple_decision(
     decided_at = _now_iso()
     req_id = _approval_id(tid)
 
-    client.table("approval_requests").update({
+    update: dict[str, Any] = {
         "status": status,
         "approver_id": approver_id,
         "decided_at": decided_at,
-    }).eq("id", approval_id).execute()
+    }
+    # Freeze the policy_checks snapshot as seen at decision time (best-effort:
+    # tolerate a missing column or unavailable computation).
+    try:
+        update["policy_checks"] = compute_policy_checks_for_transaction(client, tid)
+        client.table("approval_requests").update(update).eq("id", approval_id).execute()
+    except Exception:  # noqa: BLE001 — column absent / compute failed -> persist without it
+        update.pop("policy_checks", None)
+        client.table("approval_requests").update(update).eq("id", approval_id).execute()
 
     client.table("transactions").update({"status": status}).eq("id", tid).execute()
 
@@ -421,14 +478,15 @@ def flag_counts_for_transactions(client, transaction_ids: list[str]) -> dict[str
     if not transaction_ids:
         return {}
     counts: dict[str, int] = defaultdict(int)
-    res = (
-        client.table("transaction_flags")
-        .select("transaction_id")
-        .in_("transaction_id", transaction_ids)
-        .execute()
-    )
-    for row in res.data or []:
-        counts[str(row["transaction_id"])] += 1
+    for chunk in _chunked(transaction_ids):
+        res = (
+            client.table("transaction_flags")
+            .select("transaction_id")
+            .in_("transaction_id", chunk)
+            .execute()
+        )
+        for row in res.data or []:
+            counts[str(row["transaction_id"])] += 1
     return dict(counts)
 
 
@@ -529,6 +587,8 @@ def list_flags_enriched(client) -> list[dict]:
 
 
 def list_approvals_enriched(client) -> list[dict]:
+    from api.approval_messages import format_all_policy_violations
+    from api.policy_checks import evaluate_policy_checks
     from feature3 import budget_status, department_spend
 
     reqs_df = fetch_table(client, "approval_requests")
@@ -537,6 +597,7 @@ def list_approvals_enriched(client) -> list[dict]:
 
     df, flags, strikes, budgets = load_all_from_supabase(client)
     dept_spend = department_spend(df)
+    active_policies = load_active_policies_list(client)
 
     # Precompute O(1) lookups once instead of scanning df per approval request.
     tx_by_id: dict[str, pd.Series] = {str(r["id"]): r for _, r in df.iterrows()}
@@ -561,6 +622,16 @@ def list_approvals_enriched(client) -> list[dict]:
             continue
         emp_id = str(row["employee_id"])
         budget = budget_status(row, budgets, dept_spend)
+        status = str(req.get("status", "pending"))
+
+        if status == "pending":
+            # Recompute live so policy add/edit/delete reflects immediately.
+            policy_checks = evaluate_policy_checks(row, active_policies, budget=budget)
+        else:
+            # Decided requests keep the snapshot frozen at decision time.
+            policy_checks = _policy_checks_from_row(req)
+            if not policy_checks:
+                policy_checks = evaluate_policy_checks(row, active_policies, budget=budget)
 
         out.append({
             "id": str(req["id"]),
@@ -576,10 +647,12 @@ def list_approvals_enriched(client) -> list[dict]:
             "reason": str(req.get("reason", "")),
             "ai_recommendation": str(req.get("ai_recommendation") or "review"),
             "ai_reasoning": str(req.get("ai_reasoning") or ""),
-            "status": str(req.get("status", "pending")),
+            "status": status,
             "department_budget_remaining": budget["remaining"] if budget else 0,
             "recent_expenses": recent_by_emp.get(emp_id, [])[:5],
-            "_flag_count": len(flags.get(tid, [])),
+            "policy_checks": policy_checks,
+            # One combined string covering EVERY failed policy (frontend "all-in-one" error).
+            "policy_violation_summary": format_all_policy_violations(policy_checks),
         })
     return out
 

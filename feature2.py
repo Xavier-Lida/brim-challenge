@@ -82,15 +82,30 @@ DUPLICATE_WINDOW_DAYS = 1                 # same merchant+amount within this win
 ROUND_NUMBER_MIN_CAD = 100.0             # round-number anomaly only interesting above this
 SCAN_BATCH_SIZE = 25                     # candidate transactions per compliance LLM call
 
+# Tunables for the behavioural detectors (velocity / escalation / just-under-limit / geo).
+VELOCITY_MIN_SAME_DAY = 4                # >= this many purchases by one employee in one day
+ESCALATION_MIN_COUNT = 3                 # >= this many strictly increasing charges to one merchant
+JUST_UNDER_MARGIN = 0.10                 # within this fraction below a category limit = "just under"
+JUST_UNDER_MIN_COUNT = 2                 # >= this many just-under charges in the same category
+GEO_MIN_DISTINCT_CITIES = 2              # distinct cities for one employee on one day = implausible
+
 # Severity weight is an INTEGER 1..5 — the transaction_flags.weight CHECK in schema.sql.
 SEV_SPLIT = 5            # split to duck the approval threshold (clear intent)
 SEV_RESTRICTED = 4       # restricted merchant / category
 SEV_OVER_THRESHOLD = 3   # at/above approval threshold and not approved
 SEV_DUPLICATE = 3        # duplicate charge
+SEV_GEO = 3              # purchases in 2+ cities same day (physically implausible)
 SEV_CATEGORY_LIMIT = 2   # over a per-category soft limit (e.g. solo meal)
+SEV_VELOCITY = 2         # unusually many purchases in a single day
+SEV_ESCALATION = 2       # steadily climbing charges to the same merchant
+SEV_JUST_UNDER = 2       # repeated charges parked just below a category limit
 SEV_ROUND = 1            # round-number anomaly (booster; ignored on its own)
+SEV_WEEKEND = 1          # weekend transaction (booster; ignored on its own)
 HIGH_SEVERITY = 4        # weight >= this = strike-worthy (feature4 leans toward deny)
 ALERT_SEVERITY = 3       # weight >= this = notify / email the approver (backend.md)
+
+# Boosters never stand alone: a transaction whose only signals are boosters is dropped.
+BOOSTER_CODES = {"round_number", "weekend"}
 
 # Approved statuses -> a threshold breach that's already approved is not a violation.
 APPROVED_STATUSES = {"approved", "reimbursed", "closed", "settled"}
@@ -257,8 +272,126 @@ def detect_duplicates(df: pd.DataFrame, window_days: int) -> dict[str, list[dict
     return out
 
 
+def _with_day(df: pd.DataFrame) -> pd.DataFrame:
+    """Attach parsed datetime (_d) and calendar day (_day); drop unparseable dates."""
+    work = df.assign(_d=df["date"].map(_parse_date))
+    work = work[work["_d"].notna()].copy()
+    work["_day"] = work["_d"].map(lambda d: d.date())
+    return work
+
+
+def detect_velocity(df: pd.DataFrame, min_count: int) -> dict[str, list[dict]]:
+    """An employee racking up many purchases in a single calendar day — unusual activity."""
+    out: dict[str, list[dict]] = defaultdict(list)
+    work = _with_day(df)
+    for (_emp, _day), g in work.groupby([work["employee_id"].astype(str), "_day"]):
+        if len(g) < min_count:
+            continue
+        total = round(float(g["amount"].sum()), 2)
+        n = len(g)
+        for _, r in g.iterrows():
+            out[str(r["id"])].append({
+                "code": "velocity",
+                "message": (f"High purchase velocity: {n} separate charges totaling ${total:.2f} by the "
+                            f"same employee on {_day} — unusually concentrated activity."),
+                "weight": SEV_VELOCITY,
+                "amount_at_risk": round(float(r["amount"]), 2),
+            })
+    return out
+
+
+def detect_geo_anomaly(df: pd.DataFrame, min_cities: int) -> dict[str, list[dict]]:
+    """Same employee charging in 2+ distinct cities on one day — physically implausible travel."""
+    out: dict[str, list[dict]] = defaultdict(list)
+    if "city" not in df.columns:
+        return out
+    work = _with_day(df)
+    for (_emp, _day), g in work.groupby([work["employee_id"].astype(str), "_day"]):
+        cities = sorted({str(c).strip() for c in g["city"].tolist() if str(c).strip()})
+        if len(cities) < min_cities:
+            continue
+        joined = ", ".join(cities)
+        for _, r in g.iterrows():
+            out[str(r["id"])].append({
+                "code": "geo_anomaly",
+                "message": (f"Geographic anomaly: charges in {len(cities)} different cities ({joined}) by "
+                            f"the same employee on {_day} — physically implausible in one day."),
+                "weight": SEV_GEO,
+                "amount_at_risk": round(float(r["amount"]), 2),
+            })
+    return out
+
+
+def detect_escalating_merchant(df: pd.DataFrame, min_count: int) -> dict[str, list[dict]]:
+    """A run of strictly increasing charges to the same merchant — creeping abuse pattern."""
+    out: dict[str, list[dict]] = defaultdict(list)
+    work = df.assign(_d=df["date"].map(_parse_date), _m=df["merchant_name"].map(_norm_merchant))
+    for (_emp, _m), g in work.groupby([work["employee_id"].astype(str), "_m"], dropna=False):
+        items = [(str(r["id"]), r["_d"], float(r["amount"])) for _, r in g.iterrows() if r["_d"] is not None]
+        if len(items) < min_count:
+            continue
+        items.sort(key=lambda x: x[1])
+        display = next((str(r["merchant_name"]) for _, r in g.iterrows()
+                        if str(r.get("merchant_name") or "").strip()), _m)
+        # longest run of strictly increasing amounts in chronological order
+        run = [items[0]]
+        best: list[tuple] = []
+        for cur in items[1:]:
+            if cur[2] > run[-1][2]:
+                run.append(cur)
+            else:
+                best = run if len(run) > len(best) else best
+                run = [cur]
+        best = run if len(run) > len(best) else best
+        if len(best) < min_count:
+            continue
+        first_amt, last_amt = best[0][2], best[-1][2]
+        for tid, _, amt in best:
+            out[tid].append({
+                "code": "escalation",
+                "message": (f"Escalating charges at {display}: {len(best)} successive amounts climbing "
+                            f"from ${first_amt:.2f} to ${last_amt:.2f}."),
+                "weight": SEV_ESCALATION,
+                "amount_at_risk": round(last_amt - first_amt, 2),
+            })
+    return out
+
+
+def detect_just_under_limit(
+    df: pd.DataFrame, policy: dict, margin: float, min_count: int,
+) -> dict[str, list[dict]]:
+    """Repeated charges parked just below a category limit — deliberate cap-skimming."""
+    out: dict[str, list[dict]] = defaultdict(list)
+    limits = policy.get("category_limits_cad") or {}
+    if not limits or "brim_category" not in df.columns:
+        return out
+    for (_emp, _cat), g in df.groupby(
+            [df["employee_id"].astype(str), df["brim_category"].astype(str)], dropna=False):
+        raw_limit = limits.get(_cat)
+        if raw_limit is None:
+            continue
+        try:
+            limit = float(raw_limit)
+        except (TypeError, ValueError):
+            continue
+        lower = limit * (1.0 - margin)
+        hits = [(str(r["id"]), float(r["amount"])) for _, r in g.iterrows()
+                if lower <= float(r["amount"]) < limit]
+        if len(hits) < min_count:
+            continue
+        for tid, amt in hits:
+            out[tid].append({
+                "code": "just_under_limit",
+                "message": (f"Repeated charges just under the ${limit:.0f} {_cat} limit: {len(hits)} "
+                            f"charges within {int(margin * 100)}% of the cap (e.g. ${amt:.2f})."),
+                "weight": SEV_JUST_UNDER,
+                "amount_at_risk": round(amt, 2),
+            })
+    return out
+
+
 def detect_row_concerns(row: pd.Series, policy: dict) -> list[dict]:
-    """Per-transaction rule checks: threshold, category limit, restricted, round-number."""
+    """Per-transaction rule checks: threshold, category limit, restricted, round-number, weekend."""
     concerns: list[dict] = []
     amount = float(row["amount"])
     category = str(row.get("brim_category") or "")
@@ -307,6 +440,16 @@ def detect_row_concerns(row: pd.Series, policy: dict) -> list[dict]:
             "weight": SEV_ROUND,
             "amount_at_risk": round(amount, 2),
         })
+
+    d = _parse_date(row.get("date"))
+    if d is not None and d.weekday() >= 5:
+        concerns.append({
+            "code": "weekend",
+            "message": (f"Weekend transaction (dated {str(row.get('date'))[:10]}) — outside normal "
+                        f"business days."),
+            "weight": SEV_WEEKEND,
+            "amount_at_risk": round(amount, 2),
+        })
     return concerns
 
 
@@ -317,13 +460,21 @@ def compute_concerns(df: pd.DataFrame, policy: dict) -> dict[str, list[dict]]:
         concerns[tid].extend(cs)
     for tid, cs in detect_duplicates(df, DUPLICATE_WINDOW_DAYS).items():
         concerns[tid].extend(cs)
+    for tid, cs in detect_velocity(df, VELOCITY_MIN_SAME_DAY).items():
+        concerns[tid].extend(cs)
+    for tid, cs in detect_geo_anomaly(df, GEO_MIN_DISTINCT_CITIES).items():
+        concerns[tid].extend(cs)
+    for tid, cs in detect_escalating_merchant(df, ESCALATION_MIN_COUNT).items():
+        concerns[tid].extend(cs)
+    for tid, cs in detect_just_under_limit(df, policy, JUST_UNDER_MARGIN, JUST_UNDER_MIN_COUNT).items():
+        concerns[tid].extend(cs)
     for _, row in df.iterrows():
         cs = detect_row_concerns(row, policy)
         if cs:
             concerns[str(row["id"])].extend(cs)
-    # round-number is a booster, not a standalone violation -> drop if it's the only signal
+    # boosters (round-number, weekend) never stand alone -> drop if they're the only signal
     for tid in list(concerns):
-        if concerns[tid] and all(c["code"] == "round_number" for c in concerns[tid]):
+        if concerns[tid] and all(c["code"] in BOOSTER_CODES for c in concerns[tid]):
             del concerns[tid]
     return concerns
 
@@ -372,9 +523,23 @@ SCAN_SYSTEM = """You are a corporate expense-policy compliance officer.
 Each item is one transaction the deterministic engine already flagged as a candidate:
 you get the active policy text, the transaction, the concern signals the engine
 computed, and the employee's recent spend context. Decide whether it actually violates
-policy and reason IN CONTEXT — a client/team meal differs from a solo meal; several
-charges to one merchant just under the approval threshold is a split to dodge approval;
-identical repeated charges are duplicates; flag personal spend on the corporate card.
+policy and reason IN CONTEXT.
+
+Patterns to weigh (the engine surfaces these as concern codes — combine them, don't pick one):
+- over_threshold: at/above the pre-approval threshold and not approved.
+- split_purchase: several charges to one merchant just under the threshold = dodging approval.
+- duplicate_charge: identical repeated charges to the same merchant.
+- category_limit / just_under_limit: over a per-category cap, or repeatedly parked just below it.
+- restricted_category / restricted_merchant: spend the policy forbids outright.
+- velocity: many purchases by one employee in a single day.
+- geo_anomaly: charges in 2+ cities the same day — physically implausible travel.
+- escalation: charges to one merchant that keep climbing over time.
+- round_number / weekend: weak boosters; meaningful only alongside another signal.
+Also watch for personal spend on the corporate card and a client/team meal vs a solo meal.
+
+If MULTIPLE patterns apply to one transaction, the warning_message MUST mention ALL of
+them in one sentence (e.g. "$520 over the $500 threshold AND 4th charge that day"), and
+set the weight to the most severe.
 Assign an INTEGER severity weight 1..5 (5 = clear/intentional violation, 4 = serious,
 3 = needs approver review, 2 = soft-limit breach, 1 = weak signal); >=4 is strike-worthy.
 Reference the actual numbers, merchant, category, threshold, and any pattern. If on

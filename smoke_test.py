@@ -55,6 +55,21 @@ def summarize(payload) -> str:
     return str(payload)[:90]
 
 
+def validate_policy_checks(payload) -> tuple[bool, str]:
+    if not isinstance(payload, list) or not payload:
+        return False, "empty approvals list"
+    checks = payload[0].get("policy_checks")
+    if not isinstance(checks, list) or not checks:
+        return False, "policy_checks missing or empty"
+    required = {"policy_id", "policy_name", "status"}
+    for check in checks:
+        if not required.issubset(check.keys()):
+            return False, f"check missing keys: {check}"
+        if check["status"] not in ("passed", "failed"):
+            return False, f"invalid status: {check.get('status')}"
+    return True, f"{len(checks)} policy check(s)"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://149.28.43.72")
@@ -81,13 +96,23 @@ def main() -> int:
     ]
 
     failures = 0
+    approvals_payload = None
     for name, method, path, params, body in checks:
         status, payload, dt = call(args.base, method, path, params=params, body=body)
         ok = status is not None and 200 <= status < 300
         if not ok:
             failures += 1
+        if name == "F3 approvals list" and ok:
+            approvals_payload = payload
         tag = OK if ok else FAIL
         print(f"{tag} {name:22} {str(status):>4}  {dt:5.1f}s  {summarize(payload)}")
+
+    if approvals_payload is not None:
+        ok, detail = validate_policy_checks(approvals_payload)
+        if not ok:
+            failures += 1
+        tag = OK if ok else FAIL
+        print(f"{tag} {'policy_checks':22} {'':>4}        {detail}")
 
     print("-" * 64)
     print(f"{'ALL PASSED' if not failures else str(failures) + ' FAILED'}\n")
