@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from api.deps import supabase_client
 from api.supabase_io import (
-    apply_decision_to_supabase,
+    apply_simple_decision,
     list_approvals_enriched,
     load_active_policy,
     load_all_from_supabase,
@@ -19,7 +19,6 @@ from api.supabase_io import (
 from feature3 import (
     APPROVAL_THRESHOLD_CAD,
     build_pipeline,
-    process_decision,
     send_email_resend,
 )
 
@@ -91,27 +90,27 @@ def decide_approval(
     body: ApprovalDecisionBody,
     client=Depends(supabase_client),
 ) -> dict[str, Any]:
-    req_res = client.table("approval_requests").select("transaction_id").eq("id", approval_id).execute()
+    req_res = (
+        client.table("approval_requests")
+        .select("transaction_id, amount")
+        .eq("id", approval_id)
+        .execute()
+    )
     if not req_res.data:
         raise HTTPException(status_code=404, detail=f"Approval {approval_id} not found")
 
-    transaction_id = str(req_res.data[0]["transaction_id"])
+    row = req_res.data[0]
+    transaction_id = str(row["transaction_id"])
     decision = "approve" if body.status == "approved" else "deny"
-    employee_to = os.getenv("EMPLOYEE_EMAIL", "employee@company.com")
 
-    df, flags, strikes, budgets = load_all_from_supabase(client)
-    result = process_decision(
-        df,
-        flags,
-        strikes,
-        budgets,
-        _policy_threshold(client),
+    apply_simple_decision(
+        client,
+        approval_id,
         transaction_id,
+        float(row.get("amount") or 0),
         decision,
         body.approver_id,
-        employee_to,
     )
-    apply_decision_to_supabase(client, result)
     return {
         "approval_id": approval_id,
         "status": body.status,

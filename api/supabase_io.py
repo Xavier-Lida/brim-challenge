@@ -301,6 +301,52 @@ def apply_decision_to_supabase(client, result: dict) -> None:
     ).execute()
 
 
+def apply_simple_decision(
+    client,
+    approval_id: str,
+    transaction_id: str,
+    amount: float,
+    decision: str,
+    approver_id: str | None,
+) -> None:
+    """Persist an approve/deny without loading the full dataset.
+
+    Writes the same three rows as the full pipeline (approval status, transaction
+    status, decision notification) with identical ids/messages, but skips the
+    unused budget/spend-history context that made the PATCH handler load every
+    transaction and flag on each click.
+    """
+    from feature3 import _approval_id, _cad, _notification_id, _now_iso
+
+    decision = decision.lower().strip()
+    if decision not in ("approve", "deny"):
+        raise ValueError("decision must be 'approve' or 'deny'")
+
+    tid = str(transaction_id)
+    approved = decision == "approve"
+    status = "approved" if approved else "denied"
+    decided_at = _now_iso()
+    req_id = _approval_id(tid)
+
+    client.table("approval_requests").update({
+        "status": status,
+        "approver_id": approver_id,
+        "decided_at": decided_at,
+    }).eq("id", approval_id).execute()
+
+    client.table("transactions").update({"status": status}).eq("id", tid).execute()
+
+    notification = {
+        "id": _notification_id("decision", req_id),
+        "type": "decision",
+        "reference_id": req_id,
+        "message": f"Demande de {_cad(round(float(amount), 2))} {('approuvée' if approved else 'refusée')}.",
+        "read": False,
+        "created_at": decided_at,
+    }
+    client.table("notifications").upsert([notification], on_conflict="id").execute()
+
+
 def persist_reports_output(client, assignments: list[dict], reports: list[dict]) -> dict:
     # Persist all transaction -> event_group_id assignments in a SINGLE round-trip via
     # the apply_event_groups() RPC. The old code did one UPDATE per transaction, which
@@ -461,7 +507,7 @@ def list_flags_enriched(client) -> list[dict]:
 
 
 def list_approvals_enriched(client) -> list[dict]:
-    from feature3 import budget_status, department_spend, spend_history
+    from feature3 import budget_status, department_spend
 
     reqs_df = fetch_table(client, "approval_requests")
     if reqs_df.empty:
@@ -470,29 +516,36 @@ def list_approvals_enriched(client) -> list[dict]:
     df, flags, strikes, budgets = load_all_from_supabase(client)
     dept_spend = department_spend(df)
 
+    # Precompute O(1) lookups once instead of scanning df per approval request.
+    tx_by_id: dict[str, pd.Series] = {str(r["id"]): r for _, r in df.iterrows()}
+    recent_by_emp: dict[str, list[dict[str, Any]]] = {}
+    if not df.empty:
+        recent_sorted = df.sort_values("_d", ascending=False, na_position="last")
+        for emp_id, group in recent_sorted.groupby(recent_sorted["employee_id"].astype(str)):
+            recent_by_emp[emp_id] = [
+                {
+                    "date": str(r["date"])[:10],
+                    "merchant": str(r["merchant_name"]),
+                    "amount": round(float(r["amount"]), 2),
+                }
+                for _, r in group.head(5).iterrows()
+            ]
+
     out: list[dict] = []
     for _, req in reqs_df.iterrows():
         tid = str(req.get("transaction_id", ""))
-        match = df[df["id"] == tid]
-        if match.empty:
+        row = tx_by_id.get(tid)
+        if row is None:
             continue
-        row = match.iloc[0]
-        ctx_spend = spend_history(df, row)
+        emp_id = str(row["employee_id"])
         budget = budget_status(row, budgets, dept_spend)
-        tx_flags = flags.get(tid, [])
-
-        recent = ctx_spend.get("recent") or []
-        recent_expenses = [
-            {"date": x["date"], "merchant": x["merchant"], "amount": x["amount"]}
-            for x in recent[:5]
-        ]
 
         out.append({
             "id": str(req["id"]),
             "transaction_id": tid,
-            "employee_id": str(req.get("employee_id", row["employee_id"])),
+            "employee_id": str(req.get("employee_id", emp_id)),
             "employee_name": (
-                str(row["employee_name"]) if pd.notna(row.get("employee_name")) else str(row["employee_id"])
+                str(row["employee_name"]) if pd.notna(row.get("employee_name")) else emp_id
             ),
             "department_name": (
                 str(row["department"]) if pd.notna(row.get("department")) else "Unknown"
@@ -503,8 +556,8 @@ def list_approvals_enriched(client) -> list[dict]:
             "ai_reasoning": str(req.get("ai_reasoning") or ""),
             "status": str(req.get("status", "pending")),
             "department_budget_remaining": budget["remaining"] if budget else 0,
-            "recent_expenses": recent_expenses,
-            "_flag_count": len(tx_flags),
+            "recent_expenses": recent_by_emp.get(emp_id, [])[:5],
+            "_flag_count": len(flags.get(tid, [])),
         })
     return out
 
