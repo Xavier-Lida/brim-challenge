@@ -15,6 +15,7 @@ from api.data_loaders import (
     budgets_from_df,
     enrich_transactions,
     flags_from_df,
+    prepare_employees_for_merge,
     strikes_from_df,
 )
 from feature4 import (
@@ -575,3 +576,162 @@ def mark_notification_read(client, notification_id: str) -> dict:
     if not res.data:
         raise KeyError(f"Notification {notification_id} not found")
     return res.data[0]
+
+
+MAP_CONNECT_DAYS = 7
+
+
+def _geolocated_transactions(client) -> pd.DataFrame:
+    """Transactions with valid latitude/longitude and a parseable date."""
+    df = fetch_table(client, "transactions")
+    if df.empty:
+        return pd.DataFrame()
+    for col in ("latitude", "longitude"):
+        if col not in df.columns:
+            return pd.DataFrame()
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["latitude", "longitude"])
+    if df.empty:
+        return pd.DataFrame()
+    df["_date"] = pd.to_datetime(df.get("date"), errors="coerce", utc=True)
+    df = df.dropna(subset=["_date"])
+    return df
+
+
+def list_employees(client) -> list[dict[str, Any]]:
+    """Full employee roster with geolocated transaction counts for the map."""
+    emp_df = fetch_table(client, "employees")
+    dept_df = fetch_table(client, "departments")
+    emp_merge = prepare_employees_for_merge(
+        emp_df if not emp_df.empty else None,
+        dept_df if not dept_df.empty else None,
+    )
+
+    geo_df = _geolocated_transactions(client)
+    geo_counts: dict[str, int] = {}
+    if not geo_df.empty:
+        geo_counts = {
+            str(emp_id): int(count)
+            for emp_id, count in geo_df.groupby(geo_df["employee_id"].astype(str)).size().items()
+        }
+
+    if emp_merge is not None and not emp_merge.empty:
+        out: list[dict[str, Any]] = []
+        for _, r in emp_merge.iterrows():
+            emp_id = str(r["employee_id"])
+            name = str(r.get("employee_name") or "").strip() or emp_id
+            dept = r.get("department")
+            out.append({
+                "id": emp_id,
+                "name": name,
+                "department": str(dept) if pd.notna(dept) and str(dept).strip() else None,
+                "map_transaction_count": geo_counts.get(emp_id, 0),
+            })
+        out.sort(key=lambda x: x["name"])
+        return out
+
+    names = employee_name_map(client)
+    return [
+        {
+            "id": emp_id,
+            "name": name or emp_id,
+            "department": None,
+            "map_transaction_count": geo_counts.get(emp_id, 0),
+        }
+        for emp_id, name in sorted(names.items(), key=lambda kv: kv[1])
+    ]
+
+
+def list_map_employees(client) -> list[dict[str, Any]]:
+    """All employees for the map selector; transaction_count is geolocated purchases only."""
+    return [
+        {
+            "id": e["id"],
+            "name": e["name"],
+            "transaction_count": e["map_transaction_count"],
+        }
+        for e in list_employees(client)
+    ]
+
+
+def build_map_purchases(
+    client,
+    employee_ids: list[str] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    """Geolocated purchases per employee, with cross-city travel segments."""
+    df = _geolocated_transactions(client)
+    if df.empty:
+        return {"employees": []}
+
+    df["employee_id"] = df["employee_id"].astype(str)
+    if employee_ids:
+        df = df[df["employee_id"].isin([str(e) for e in employee_ids])]
+
+    if date_from:
+        start = pd.to_datetime(date_from, errors="coerce", utc=True)
+        if pd.notna(start):
+            df = df[df["_date"] >= start]
+    if date_to:
+        end = pd.to_datetime(date_to, errors="coerce", utc=True)
+        if pd.notna(end):
+            df = df[df["_date"] <= end]
+
+    if df.empty:
+        return {"employees": []}
+
+    names = employee_name_map(client)
+    tx_ids = [str(t) for t in df["id"].tolist()]
+    flags = flag_counts_for_transactions(client, tx_ids)
+
+    employees: list[dict[str, Any]] = []
+    for emp_id, group in df.groupby("employee_id"):
+        group = group.sort_values("_date")
+
+        points: list[dict[str, Any]] = []
+        nodes: list[dict[str, Any]] = []
+        for _, r in group.iterrows():
+            tid = str(r["id"])
+            date_str = str(r.get("date", ""))[:10]
+            city = str(r.get("city") or "")
+            lat = float(r["latitude"])
+            lng = float(r["longitude"])
+            points.append({
+                "transaction_id": tid,
+                "lat": lat,
+                "lng": lng,
+                "city": city,
+                "merchant_name": str(r.get("merchant_name") or ""),
+                "merchant_category": str(r.get("merchant_category") or ""),
+                "amount": float(r.get("amount") or 0),
+                "date": date_str,
+                "flag_count": int(flags.get(tid, 0)),
+            })
+            nodes.append({
+                "transaction_id": tid,
+                "lat": lat,
+                "lng": lng,
+                "city": city,
+                "date": date_str,
+                "_dt": r["_date"],
+            })
+
+        segments: list[dict[str, Any]] = []
+        for prev, cur in zip(nodes, nodes[1:]):
+            days = int((cur["_dt"] - prev["_dt"]).days)
+            if days <= MAP_CONNECT_DAYS and prev["city"] != cur["city"]:
+                segments.append({
+                    "from": {k: v for k, v in prev.items() if k != "_dt"},
+                    "to": {k: v for k, v in cur.items() if k != "_dt"},
+                    "days_between": days,
+                })
+
+        employees.append({
+            "employee_id": str(emp_id),
+            "name": names.get(str(emp_id), str(emp_id)),
+            "points": points,
+            "segments": segments,
+        })
+
+    return {"employees": employees}
