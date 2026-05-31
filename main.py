@@ -1,11 +1,32 @@
+from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI()
+from api.deps import cors_origins
+from api.routes import approvals, compliance, flags, reports, transactions
+
+load_dotenv()
+
+app = FastAPI(title="Brim API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(compliance.router)
+app.include_router(flags.router)
+app.include_router(approvals.router)
+app.include_router(reports.router)
+app.include_router(transactions.router)
 
 
 @app.get("/")
 def read_root():
-    return {"message": "Hello, World!"}
+    return {"message": "Brim API", "docs": "/docs"}
 
 
 @app.get("/health")

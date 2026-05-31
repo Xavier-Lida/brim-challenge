@@ -70,6 +70,7 @@ CREATE TABLE transaction_flags (
     transaction_id  TEXT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
     warning_message TEXT NOT NULL,
     weight          SMALLINT NOT NULL CHECK (weight BETWEEN 1 AND 5),
+    reviewed        BOOLEAN NOT NULL DEFAULT FALSE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
