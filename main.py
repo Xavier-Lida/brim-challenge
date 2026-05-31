@@ -8,6 +8,7 @@ from api.routes import (
     assistant,
     compliance,
     flags,
+    map_view,
     notifications,
     policies,
     reports,
@@ -31,6 +32,7 @@ app.include_router(compliance.router)
 app.include_router(flags.router)
 app.include_router(approvals.router)
 app.include_router(reports.router)
+app.include_router(map_view.router)
 app.include_router(transactions.router)
 app.include_router(assistant.router)
 app.include_router(policies.router)
