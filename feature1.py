@@ -340,6 +340,40 @@ def guard_sql(sql: str) -> str:
     return s
 
 
+# Aggregate over `date` used bare inside a WHERE/HAVING clause — DuckDB rejects this
+# ("aggregates are not allowed in WHERE"). The LLM occasionally emits it for "current quarter".
+_AGG_OVER_DATE = re.compile(r"\b(max|min|avg|sum|count)\s*\(\s*(?:tx\.)?date\s*\)", re.I)
+
+
+def _fix_aggregate_in_where(sql: str) -> str | None:
+    """Rewrite a bare aggregate over `date` inside WHERE/HAVING into a scalar subquery.
+
+    Returns the corrected SQL, or None when the pattern is absent. Scoped to the WHERE/HAVING
+    span so legitimate aggregates in the SELECT list / GROUP BY / ORDER BY are untouched.
+    """
+    where = re.search(r"\b(where|having)\b", sql, re.I)
+    if not where:
+        return None
+    start = where.end()
+    tail = re.search(r"\b(group\s+by|order\s+by|limit|window|qualify)\b", sql[start:], re.I)
+    end = start + tail.start() if tail else len(sql)
+    clause = sql[start:end]
+    if not _AGG_OVER_DATE.search(clause):
+        return None
+
+    def _wrap(m: re.Match) -> str:
+        # Skip an aggregate already projected by a subquery (…(SELECT max(date) FROM tx)…)
+        # to avoid double-wrapping it into a non-scalar subquery.
+        if re.search(r"select\s+$", clause[: m.start()], re.I):
+            return m.group(0)
+        return f"(SELECT {m.group(1).lower()}(date) FROM tx)"
+
+    fixed = _AGG_OVER_DATE.sub(_wrap, clause)
+    if fixed == clause:
+        return None
+    return sql[:start] + fixed + sql[end:]
+
+
 def execute_with_repair(
     con,
     sql: str,
@@ -355,7 +389,18 @@ def execute_with_repair(
             return con.execute(safe).fetchdf(), safe, None
         except Exception as exc:  # noqa: BLE001
             last_err = str(exc)
-            if repair is None or attempt == REPAIR_RETRIES:
+            if attempt == REPAIR_RETRIES:
+                break
+            # 1) Cheap deterministic fix for the common aggregate-in-WHERE error — try it
+            #    first so a correct rewrite doesn't burn an LLM repair round.
+            det = _fix_aggregate_in_where(sql)
+            if det is not None and det != sql:
+                sql = det
+                if before_repair is not None:
+                    before_repair()
+                continue
+            # 2) Otherwise fall back to the LLM repair.
+            if repair is None:
                 break
             if before_repair is not None:
                 before_repair()
@@ -395,6 +440,10 @@ GROUP BY for breakdowns, ROUND(SUM(amount),2) for totals, and a single KPI value
 question asks for one number. Choose the best chart: kpi (one number), line (time series),
 bar (category comparison), pie (share of a whole), table (detail rows). Never write to the DB.
 
+CRITICAL: WHERE and HAVING must never contain a bare aggregate. To reference the latest
+date, use a scalar subquery — date_trunc('quarter', (SELECT max(date) FROM tx)) — never
+date_trunc('quarter', max(date)), which DuckDB rejects (aggregates are not allowed in WHERE).
+
 Scope: set in_scope=false when the question is NOT about company spending analytics,
 compliance (flags/strikes), policy/budgets, approvals/reports in the data, or how to use
 the Brim dashboard. Employee-vs-employee, department-vs-department, period comparisons,
@@ -410,8 +459,12 @@ When the question is about Brim dashboard navigation only (where to click, which
 set in_scope=true and use: SELECT 'dashboard_help' AS topic LIMIT 1 with chart=table and
 title='Brim dashboard'.
 
-Defaults when the user omits details: current quarter (date >= date_trunc('quarter', max(date)))
-for period; ROUND(SUM(amount),2) for spend comparisons. Filter tx.employee_name when two
+Period defaults: assume the current quarter
+(date >= date_trunc('quarter', (SELECT max(date) FROM tx))) ONLY for spend/amount questions
+that omit a period. For counts or lookups of flagged transactions, compliance flags, strikes,
+or approvals — and for "which one / laquelle" follow-ups — do NOT add any date filter unless
+the user names a period; count or list across all data so the answer is stable. Use
+ROUND(SUM(amount),2) for spend comparisons. Filter tx.employee_name when two
 employees are named or when comparing employees.
 
 {schema}
@@ -421,7 +474,10 @@ Conversation so far (for follow-ups; resolve pronouns/comparisons against it):
 
 NARRATE_BASE = """You are a finance analytics assistant. Given the question and the query
 result rows (JSON), write a concise 1-3 sentence answer for a non-technical finance manager.
-Reference the actual numbers. Do not invent data beyond the rows. No preamble."""
+Reference the actual numbers. Do not invent data beyond the rows. No preamble.
+Report only what the rows contain: if the question asks for N items (e.g. "top 3") but fewer
+rows are returned, describe exactly the rows present and never state a higher count than the
+rows support. Match any count you mention to the number of rows."""
 
 
 def make_llm_steps(schema: str, history: str):

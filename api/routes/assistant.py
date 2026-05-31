@@ -23,6 +23,17 @@ logger = logging.getLogger("brim.assistant")
 
 router = APIRouter(prefix="/api/assistant", tags=["assistant"])
 
+# Debug indicator: prefix shown on any answer that did NOT come from a live
+# Gemini call (explicit mock, or LLM failure that silently degraded to mock).
+_MOCK_TAG = "[M] "
+
+
+def _engine_of(mock_llm: bool, degraded: bool) -> str:
+    """gemini = real LLM answered · mock = mock_llm forced · degraded = LLM failed → mock."""
+    if mock_llm:
+        return "mock"
+    return "degraded" if degraded else "gemini"
+
 
 class HistoryTurn(BaseModel):
     question: str
@@ -67,11 +78,18 @@ def ask_assistant(
         except Exception as inner:
             raise HTTPException(status_code=500, detail=str(inner)) from exc
 
+    engine = _engine_of(mock_llm, bool(result.get("_degraded")))
+    text = result["text"]
+    if engine != "gemini":
+        text = _MOCK_TAG + text
+
     return {
-        "text": result["text"],
+        "text": text,
         "visualization": result.get("visualization"),
         "followUpSuggestions": result["followUpSuggestions"],
         "sql": result.get("sql"),
+        "engine": engine,
+        "mock": engine != "gemini",
     }
 
 
@@ -96,32 +114,42 @@ def ask_assistant_stream(
     def event_stream() -> Iterator[str]:
         con = None
         present: set[str] | None = None
-        events = None
+        tagged = {"done": False}
+
+        def pump(events, engine):
+            """Relay events, prefixing the first text chunk with [M] when not live Gemini."""
+            for event in events:
+                if (engine != "gemini" and not tagged["done"]
+                        and event.get("type") == "text_delta"):
+                    event = {**event, "delta": _MOCK_TAG + event.get("delta", "")}
+                    tagged["done"] = True
+                yield _sse(event)
+
         try:
             yield _sse(_status_event("loading_data", question))
             con, present = build_db_from_supabase(client, limit=limit)
-            events = stream_answer_events(con, present, question, history, use_llm)
-        except Exception as exc:  # noqa: BLE001 — prep / plan / SQL failed
-            logger.warning("assistant stream LLM path failed, degrading to mock: %s", exc)
+            engine = _engine_of(mock_llm, degraded=False)
             try:
-                if con is None or present is None:
-                    yield _sse(_status_event("loading_data", question))
-                    con, present = build_db_from_supabase(client, limit=limit)
-                events = stream_answer_events(
-                    con, present, question, history, use_llm=False, degraded=True,
+                yield from pump(
+                    stream_answer_events(con, present, question, history, use_llm), engine,
                 )
-            except Exception as inner:  # noqa: BLE001
-                yield _sse({"type": "error", "message": str(inner)})
-                yield _sse({"type": "done"})
-                return
-
-        try:
-            if events is not None:
-                for event in events:
-                    yield _sse(event)
-        except Exception as exc:  # noqa: BLE001 — narration stream failed mid-flight
-            logger.warning("assistant narration stream failed: %s", exc)
-            yield _sse({"type": "error", "message": str(exc)})
+            except Exception as exc:  # noqa: BLE001 — plan / SQL / narration failed
+                # Live Gemini failed before streaming any text → degrade to a tagged mock,
+                # mirroring the sync route. If text already streamed, surface the error.
+                if not use_llm or tagged["done"]:
+                    logger.warning("assistant narration stream failed: %s", exc)
+                    yield _sse({"type": "error", "message": str(exc)})
+                    yield _sse({"type": "done"})
+                    return
+                logger.warning("assistant stream LLM path failed, degrading to mock: %s", exc)
+                yield from pump(
+                    stream_answer_events(
+                        con, present, question, history, use_llm=False, degraded=True,
+                    ),
+                    "degraded",
+                )
+        except Exception as inner:  # noqa: BLE001 — data load failed; nothing to degrade to
+            yield _sse({"type": "error", "message": str(inner)})
             yield _sse({"type": "done"})
         finally:
             if con is not None:
