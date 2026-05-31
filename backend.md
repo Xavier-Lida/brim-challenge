@@ -62,9 +62,9 @@ Reçoit un PDF (base64) ou du texte brut. Le moteur [`api/policy_import.py`](api
 
 CRUD standard sur les policies. Le PATCH permet de modifier les `policy_requirements` et le champ `active` (toggle UI = désactiver sans supprimer). Le DELETE supprime définitivement la ligne dans `policies` (hard delete).
 
-### `GET /api/approvals` · `PATCH /api/approvals/[id]`
+### `GET /api/approvals` · `POST /api/approvals/run` · `PATCH /api/approvals/[id]`
 
-GET retourne les demandes d'approbation en attente avec le détail de l'employé, le budget restant de son département, et son historique de dépenses récent. PATCH traite la décision (approve/deny) : met à jour `approval_requests`, met à jour le statut de la transaction dans `transactions`, et envoie un email de confirmation à l'employé via Resend.
+Servi par le **moteur Feature 3** (`feature3.py`, voir plus bas). GET retourne les demandes d'approbation en attente avec le détail de l'employé, le budget restant de son département, et son historique de dépenses récent. `POST /api/approvals/run` lance le pipeline : sélection des transactions nécessitant un aval (montant > seuil **ou** flag de poids ≥ 3), construction des `approval_requests` avec recommandation IA (`approve`/`review`/`deny`), création des notifications et des emails approbateur. PATCH traite la décision (approve/deny) : met à jour `approval_requests`, met à jour le statut de la transaction dans `transactions`, crée une notification `type='decision'`, et envoie un email de confirmation à l'employé via Resend.
 
 ### `POST /api/reports/generate`
 
@@ -138,6 +138,38 @@ py feature2.py --transactions transactions.csv --mock-llm   # aucun appel API
 
 ---
 
+## Feature 3 — Moteur de notifications & décision d'approbation (`feature3.py`)
+
+Pipeline autonome qui transforme les `transactions` nécessitant un aval humain en notifications prêtes à décider pour le **company approver**. Lit et écrit dans Supabase (`api/supabase_io.load_all_from_supabase` / `persist_pipeline_to_supabase`). L'approbateur reçoit tout d'un coup — la demande, l'historique de dépenses de l'employé, le statut budgétaire du département, et une recommandation IA `approve`/`review`/`deny` avec raisonnement — et décide **une seule fois, sans aller-retour**. Même tolérance aux pannes que F2/F4 : toute erreur LLM dégrade vers une recommandation déterministe (jamais d'échec dur).
+
+```
+{
+  "approval_requests": [ {id, transaction_id, employee_id, amount, reason,
+                          ai_recommendation, ai_reasoning, status, approver_id, decided_at} ], // -> upsert approval_requests
+  "notifications":     [ {id, type, reference_id, message, read, created_at} ],   // -> upsert notifications (type 'flag' | 'approval')
+  "approver_emails":   [ {approval_request_id, to, subject, text, html, deep_link} ]           // -> envoi via Resend
+}
+```
+
+**Sélection — quelles transactions nécessitent une approbation.** `amount` > seuil (défaut **1000 CAD**, `--threshold`) **OU** présence d'un flag de poids ≥ `FLAG_NOTIFY_WEIGHT = 3`. Ce second critère s'imbrique avec Feature 2 : F2 signale les montants ≥ 500 \$ comme `over_threshold` (weight 3), ce qui fait remonter les transactions de 500–1000 \$ déjà flaggées dans la file d'approbation via le chemin « flag », tandis que tout montant > 1000 \$ y entre directement. Les deux seuils sont **distincts et complémentaires** : 500 \$ = seuil de pré-approbation *politique* (côté F2) ; 1000 \$ = gros montant nécessitant un *aval humain* (côté F3).
+
+**Étapes**
+
+1. **Contexte par demande.** Statut budgétaire du département pour le trimestre (`budget − engagé hors cette demande`, via `budgets`), historique de dépenses de l'employé (total YTD, dépenses similaires antérieures par MCC, 5 transactions récentes), flags de conformité (`transaction_flags`) et historique de strikes (`employee_strikes`).
+2. **Recommandation IA** (`approve` / `review` / `deny`) par lots de `RECO_BATCH_SIZE = 25`, avec **fallback déterministe** : poids max ≥ `DENY_WEIGHT = 4` ou ≥ 2 strikes → `deny` ; au-dessus du budget restant → `review` ; flags présents → `review` ; montant > seuil sans avertissement → `review` ; sinon `approve`.
+3. **Notifications & emails.** Une notification `type='flag'` par transaction signalée (triées par poids décroissant), une notification `type='approval'` par demande, et un email approbateur (FR, HTML + texte, avec *deep link* `/approvals/{id}`) — envoyé via Resend si `--send`.
+4. **Mode décision** (`--decide <transaction_id> --decision approve|deny`) : traite une décision unique → met à jour `approval_requests` (`status` approved/denied, `approver_id`, `decided_at`), met à jour `transactions.status`, crée une notification `type='decision'`, et envoie l'email de confirmation à l'employé (`apply_decision_to_supabase`).
+
+Les ids `approval_request` / `notification` sont dérivés de façon déterministe (`uuid5`) → upserts idempotents et `--decide` retrouve une demande sans id persisté. Variables d'env : `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (+ `RESEND_API_KEY` pour `--send`). Routes servies : `POST /api/approvals/run` (pipeline) et `PATCH /api/approvals/{id}` (décision).
+
+```
+py feature3.py --mock-llm --out feature3_output.json
+py feature3.py --threshold 1000 --mock-llm
+py feature3.py --decide tx-001 --decision approve --approver-id cfo-1
+```
+
+---
+
 ## Feature 4 — Moteur de génération de rapports (`feature4.py`)
 
 Pipeline batch autonome (pandas + LangChain · Gemini, défaut `gemini-2.5-flash` configurable via `GEMINI_MODEL` / `--model`) qui transforme des `transactions` en `expense_reports` prêts à approuver. Il parle directement le schéma Supabase via des CSV en entrée (`transactions` + `mcc_codes` requis ; `transaction_flags`, `employee_strikes`, `employees`, `departments` optionnels) et émet du JSON réinjectable :
@@ -182,9 +214,10 @@ Import policy
   → Gemini extrait les règles → preview UI → confirmation → INSERT policies
   → ces policies sont chargées à chaque appel de /api/compliance/scan
 
-Assistant
-  → messages + contexte → données Supabase injectées dans le prompt → Gemini
-  → { text, visualization, followUpSuggestions } retourné au frontend
+Assistant (Feature 1)
+  → question + historique → PLAN (Gemini → SQL) → GUARD (SELECT lecture seule + LIMIT)
+    → EXECUTE (DuckDB en local / Supabase en prod) → REPAIR si erreur SQL → NARRATE
+  → { text, visualization, followUpSuggestions, sql } retourné au frontend
 ```
 
 ---
