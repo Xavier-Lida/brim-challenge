@@ -131,7 +131,14 @@ def ask_assistant_stream(
             engine = _engine_of(mock_llm, degraded=False)
             try:
                 yield from pump(
-                    stream_answer_events(con, present, question, history, use_llm), engine,
+                    stream_answer_events(
+                        con,
+                        present,
+                        question,
+                        history,
+                        use_llm,
+                    ),
+                    engine,
                 )
             except Exception as exc:  # noqa: BLE001 — plan / SQL / narration failed
                 # Live Gemini failed before streaming any text → degrade to a tagged mock,
@@ -144,7 +151,12 @@ def ask_assistant_stream(
                 logger.warning("assistant stream LLM path failed, degrading to mock: %s", exc)
                 yield from pump(
                     stream_answer_events(
-                        con, present, question, history, use_llm=False, degraded=True,
+                        con,
+                        present,
+                        question,
+                        history,
+                        use_llm=False,
+                        degraded=True,
                     ),
                     "degraded",
                 )

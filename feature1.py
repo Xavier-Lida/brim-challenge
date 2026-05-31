@@ -47,7 +47,6 @@ import pandas as pd
 from api.assistant_prompts import build_narrate_system
 from feature4 import build_mcc_category_map, load_transactions, make_chat_llm
 
-
 # =========================================================================== #
 # Config
 # =========================================================================== #
@@ -115,6 +114,16 @@ _ANALYTICS_INTENT_RE = re.compile(
 CAPABILITIES: list[dict] = [
     {"id": "spend_by_dept_cat", "chip": "Spend by department & category", "needs": ["tx"],
      "kw": r"spend|spent|category|software|travel|meal"},
+    {"id": "spend_by_department", "chip": "Spend by department", "needs": ["tx"],
+     "kw": r"department|dept|département"},
+    {"id": "spend_by_category", "chip": "Spend by category", "needs": ["tx"],
+     "kw": r"category|brim_category|mcc"},
+    {"id": "spend_by_city", "chip": "Spend by city", "needs": ["tx"],
+     "kw": r"city|ville|location|cities"},
+    {"id": "total_spend", "chip": "Total company spend", "needs": ["tx"],
+     "kw": r"total spend|company spend|overall"},
+    {"id": "top_employees", "chip": "Top employee spenders", "needs": ["tx"],
+     "kw": r"top|spender|employee.*spend|employé|employe"},
     {"id": "compare_depts", "chip": "Compare two departments", "needs": ["tx"],
      "kw": r"compare|versus|\bvs\b|difference"},
     {"id": "compare_employees", "chip": "Compare two employees", "needs": ["tx"],
@@ -138,13 +147,861 @@ def available_capabilities(present: set[str]) -> list[dict]:
     return [c for c in CAPABILITIES if set(c["needs"]).issubset(present)]
 
 
-def suggest_chips(question: str, present: set[str], answered_id: str | None) -> list[str]:
-    """Rank available capabilities by keyword relevance to the question; never repeat
-    the one just answered. Deterministic -> chips are guaranteed answerable."""
+_SPEND_CAP_IDS = frozenset({
+    "spend_by_dept_cat",
+    "spend_by_department",
+    "spend_by_category",
+    "spend_by_city",
+    "total_spend",
+    "top_employees",
+    "compare_depts",
+    "compare_employees",
+    "top_merchants",
+    "spend_trend",
+})
+_COMPLIANCE_CAP_IDS = frozenset({"most_flagged", "repeat_offenders", "split_attempts"})
+_BUDGET_CAP_IDS = frozenset({"budget_status"})
+
+_VIZ_CHIP_BIAS: dict[str, str] = {
+    "bar": "spend_by_dept_cat",
+    "line": "spend_trend",
+    "table": "top_employees",
+    "pie": "spend_by_category",
+    "kpi": "total_spend",
+}
+
+
+def _cap_family(cap_id: str) -> str | None:
+    if cap_id in _SPEND_CAP_IDS:
+        return "spend"
+    if cap_id in _COMPLIANCE_CAP_IDS:
+        return "compliance"
+    if cap_id in _BUDGET_CAP_IDS:
+        return "budget"
+    return None
+
+
+def suggest_chips(
+    question: str,
+    present: set[str],
+    answered_id: str | None,
+    *,
+    viz_type: str | None = None,
+) -> list[str]:
+    """Rank capabilities by relevance, pivot away from the answered family, and bias by viz shape."""
     q = question.lower()
     caps = [c for c in available_capabilities(present) if c["id"] != answered_id]
-    scored = sorted(caps, key=lambda c: (bool(re.search(c["kw"], q)), c["id"]), reverse=True)
-    return [c["chip"] for c in scored[:3]]
+    answered_family = _cap_family(answered_id) if answered_id else None
+    pivot_families: set[str] = set()
+    if answered_family == "spend":
+        pivot_families = {"compliance", "budget"}
+    elif answered_family == "compliance":
+        pivot_families = {"spend", "budget"}
+    elif answered_family == "budget":
+        pivot_families = {"spend", "compliance"}
+
+    viz_bias_id = _VIZ_CHIP_BIAS.get(viz_type or "")
+
+    def score(cap: dict) -> tuple:
+        cap_id = cap["id"]
+        kw_hit = bool(re.search(cap["kw"], q))
+        family = _cap_family(cap_id)
+        pivot = 1 if family and family in pivot_families else 0
+        viz_match = 1 if viz_bias_id and cap_id == viz_bias_id else 0
+        return (pivot, kw_hit, viz_match, cap_id)
+
+    scored = sorted(caps, key=score, reverse=True)
+    chips = [c["chip"] for c in scored[:3]]
+    if chips:
+        return chips
+    return [c["chip"] for c in available_capabilities(present)[:3]]
+
+
+# =========================================================================== #
+# Contextual follow-ups (LLM + heuristics; registry chips as last resort)
+# =========================================================================== #
+
+_FOLLOW_UP_ENTITY_KEYS = (
+    "employee_name",
+    "department",
+    "city",
+    "merchant_name",
+    "brim_category",
+)
+
+
+def _collect_column_values(rows: list[dict], key: str, limit: int = 5) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for row in rows:
+        raw = row.get(key)
+        if raw is None:
+            continue
+        value = str(raw).strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _viz_series_names(viz: dict | None, limit: int = 5) -> list[str]:
+    if not viz:
+        return []
+    data = viz.get("data") or {}
+    names: list[str] = []
+    for bucket in ("series", "segments"):
+        for item in data.get(bucket) or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if name and name not in names:
+                names.append(name)
+            if len(names) >= limit:
+                return names
+    return names
+
+
+def _follow_up_context(
+    question: str,
+    present: set[str],
+    rows: list[dict] | None,
+    *,
+    plan: dict | None = None,
+    viz: dict | None = None,
+    answered_id: str | None = None,
+) -> dict:
+    rows = rows or []
+    viz = viz or {}
+    employees = _collect_column_values(rows, "employee_name")
+    departments = _collect_column_values(rows, "department")
+    cities = _collect_column_values(rows, "city")
+    merchants = _collect_column_values(rows, "merchant_name")
+    categories = _collect_column_values(rows, "brim_category")
+
+    series_names = _viz_series_names(viz)
+    if not employees and series_names and answered_id in ("top_employees", None):
+        if plan and plan.get("chart") in ("bar", "pie", "table"):
+            employees = series_names[:5]
+    if not departments and series_names and answered_id in (
+        "spend_by_department",
+        "spend_by_dept_cat",
+        None,
+    ):
+        departments = series_names[:5]
+
+    caps = available_capabilities(present)
+    return {
+        "present": present,
+        "question": question,
+        "french": _is_french(question),
+        "answered_id": answered_id,
+        "plan_title": (plan or {}).get("title"),
+        "plan_chart": (plan or {}).get("chart"),
+        "viz_type": viz.get("type"),
+        "viz_title": viz.get("title"),
+        "rows_sample": rows[:8],
+        "employees": employees,
+        "departments": departments,
+        "cities": cities,
+        "merchants": merchants,
+        "categories": categories,
+        "series_names": series_names,
+        "capabilities": [{"id": c["id"], "chip": c["chip"]} for c in caps],
+        "has_flags": "flags" in present,
+        "has_strikes": "strikes" in present,
+        "has_budget": "budget" in present,
+    }
+
+
+def _follow_up_item(
+    label: str,
+    prompt: str,
+    hint: str,
+    *,
+    angle: str = "pivot",
+) -> dict:
+    return {
+        "label": label[:48],
+        "prompt": prompt.strip(),
+        "hint": hint.strip(),
+        "angle": angle,
+    }
+
+
+def _chips_to_structured(chips: list[str], ctx: dict) -> list[dict]:
+    fr = ctx.get("french", False)
+    out: list[dict] = []
+    for chip in chips[:3]:
+        out.append(
+            _follow_up_item(
+                chip,
+                chip,
+                (
+                    "Suite suggérée à votre dernière question."
+                    if fr
+                    else "Suggested next step from your last question."
+                ),
+            )
+        )
+    return out
+
+
+def suggest_contextual_follow_ups(ctx: dict) -> list[dict]:
+    """Rule-based contextual follow-ups for mock / degraded paths."""
+    fr = bool(ctx.get("french"))
+    q = ctx.get("question") or ""
+    aid = ctx.get("answered_id")
+    employees: list[str] = list(ctx.get("employees") or [])
+    departments: list[str] = list(ctx.get("departments") or [])
+    merchants: list[str] = list(ctx.get("merchants") or [])
+    categories: list[str] = list(ctx.get("categories") or [])
+    cities: list[str] = list(ctx.get("cities") or [])
+    has_flags = bool(ctx.get("has_flags"))
+    has_budget = bool(ctx.get("has_budget"))
+
+    emp = employees[0] if employees else None
+    dept = departments[0] if departments else None
+    dept2 = departments[1] if len(departments) > 1 else None
+    merchant = merchants[0] if merchants else None
+    category = categories[0] if categories else None
+    city = cities[0] if cities else None
+
+    period_fr = ""
+    period_en = ""
+    if _period_clause(q):
+        period_fr = " pour la même période"
+        period_en = " for the same period"
+
+    items: list[dict] = []
+
+    if aid == "top_employees" and emp:
+        if fr:
+            items.append(
+                _follow_up_item(
+                    f"{emp.split()[0]} — par catégorie",
+                    f"Détail des dépenses de {emp} par catégorie{period_fr}",
+                    f"Zoom sur le premier employé du classement ({emp}).",
+                    angle="narrow",
+                )
+            )
+            pivot_dept = dept or "son département"
+            items.append(
+                _follow_up_item(
+                    "Dépenses par département",
+                    f"Montre les dépenses par département{period_fr}",
+                    f"Compare les départements, dont celui de {emp}.",
+                    angle="pivot",
+                )
+            )
+            if has_flags:
+                items.append(
+                    _follow_up_item(
+                        "Flags de conformité",
+                        f"Quels flags de conformité pour {emp} ?",
+                        "Élargir vers la conformité pour cet employé.",
+                        angle="broaden",
+                    )
+                )
+            else:
+                items.append(
+                    _follow_up_item(
+                        "Tendance mensuelle",
+                        "Montre la tendance mensuelle des dépenses cette année",
+                        "Vue plus large dans le temps.",
+                        angle="broaden",
+                    )
+                )
+        else:
+            items.append(
+                _follow_up_item(
+                    f"{emp.split()[0]} — by category",
+                    f"Show {emp}'s spend breakdown by category{period_en}",
+                    f"Drill into the top spender ({emp}).",
+                    angle="narrow",
+                )
+            )
+            items.append(
+                _follow_up_item(
+                    "Spend by department",
+                    f"Show spend by department{period_en}",
+                    "Pivot to department totals.",
+                    angle="pivot",
+                )
+            )
+            if has_flags:
+                items.append(
+                    _follow_up_item(
+                        "Compliance flags",
+                        f"Which compliance flags does {emp} have?",
+                        "Broaden to compliance for this employee.",
+                        angle="broaden",
+                    )
+                )
+            else:
+                items.append(
+                    _follow_up_item(
+                        "Monthly spend trend",
+                        "Show monthly company spend trend this year",
+                        "Broader time-series view.",
+                        angle="broaden",
+                    )
+                )
+
+    elif aid in ("spend_by_department", "spend_by_dept_cat") and dept:
+        if fr:
+            items.append(
+                _follow_up_item(
+                    f"Top employés — {dept}",
+                    f"Top 10 employés les plus dépensiers dans {dept}{period_fr}",
+                    f"Zoom sur le département leader ({dept}).",
+                    angle="narrow",
+                )
+            )
+            if dept2:
+                items.append(
+                    _follow_up_item(
+                        f"Comparer {dept} et {dept2}",
+                        f"Compare les dépenses entre {dept} et {dept2}{period_fr}",
+                        "Comparer deux départements du résultat.",
+                        angle="pivot",
+                    )
+                )
+            else:
+                items.append(
+                    _follow_up_item(
+                        "Par catégorie",
+                        f"Montre les dépenses par catégorie{period_fr}",
+                        "Autre dimension de dépense.",
+                        angle="pivot",
+                    )
+                )
+            if has_budget:
+                items.append(
+                    _follow_up_item(
+                        "Dépassements budget",
+                        f"Quels départements dépassent le budget ce trimestre ?",
+                        "Relier dépenses et budgets.",
+                        angle="broaden",
+                    )
+                )
+            elif has_flags:
+                items.append(
+                    _follow_up_item(
+                        "Employés les plus flaggés",
+                        "Quels employés ont le plus de flags de conformité ?",
+                        "Passer à la conformité.",
+                        angle="broaden",
+                    )
+                )
+            else:
+                items.append(
+                    _follow_up_item(
+                        "Top employés (entreprise)",
+                        "Top 10 employés les plus dépensiers",
+                        "Vue entreprise plus large.",
+                        angle="broaden",
+                    )
+                )
+        else:
+            items.append(
+                _follow_up_item(
+                    f"Top spenders — {dept}",
+                    f"Top 10 employee spenders in {dept}{period_en}",
+                    f"Drill into leading department ({dept}).",
+                    angle="narrow",
+                )
+            )
+            if dept2:
+                items.append(
+                    _follow_up_item(
+                        f"Compare {dept} vs {dept2}",
+                        f"Compare spend between {dept} and {dept2}{period_en}",
+                        "Compare two departments from the chart.",
+                        angle="pivot",
+                    )
+                )
+            else:
+                items.append(
+                    _follow_up_item(
+                        "Spend by category",
+                        f"Show spend by category{period_en}",
+                        "Pivot to expense categories.",
+                        angle="pivot",
+                    )
+                )
+            if has_budget:
+                items.append(
+                    _follow_up_item(
+                        "Over budget",
+                        "Which departments are over budget this quarter?",
+                        "Connect spend to budgets.",
+                        angle="broaden",
+                    )
+                )
+            elif has_flags:
+                items.append(
+                    _follow_up_item(
+                        "Most flagged employees",
+                        "Which employees have the most compliance flags?",
+                        "Broaden to compliance.",
+                        angle="broaden",
+                    )
+                )
+            else:
+                items.append(
+                    _follow_up_item(
+                        "Top company spenders",
+                        "Top 10 employee spenders",
+                        "Company-wide ranking.",
+                        angle="broaden",
+                    )
+                )
+
+    elif aid == "spend_by_category" and category:
+        narrow_l = f"{category[:20]} — par employé" if fr else f"{category[:20]} — by employee"
+        if fr:
+            items.extend(
+                [
+                    _follow_up_item(
+                        narrow_l,
+                        f"Top employés pour la catégorie {category}{period_fr}",
+                        f"Qui dépense le plus en {category} ?",
+                        angle="narrow",
+                    ),
+                    _follow_up_item(
+                        "Par département",
+                        f"Dépenses par département{period_fr}",
+                        "Changer de dimension.",
+                        angle="pivot",
+                    ),
+                    _follow_up_item(
+                        "Top commerçants",
+                        f"Top commerçants pour {category}{period_fr}",
+                        "Voir les fournisseurs dominants.",
+                        angle="broaden",
+                    ),
+                ]
+            )
+        else:
+            items.extend(
+                [
+                    _follow_up_item(
+                        narrow_l,
+                        f"Top employees for {category}{period_en}",
+                        f"Who spends most on {category}?",
+                        angle="narrow",
+                    ),
+                    _follow_up_item(
+                        "Spend by department",
+                        f"Show spend by department{period_en}",
+                        "Pivot to departments.",
+                        angle="pivot",
+                    ),
+                    _follow_up_item(
+                        "Top merchants",
+                        f"Top merchants for {category}{period_en}",
+                        "See dominant vendors.",
+                        angle="broaden",
+                    ),
+                ]
+            )
+
+    elif aid == "spend_by_city" and city:
+        if fr:
+            items.extend(
+                [
+                    _follow_up_item(
+                        f"Dépenses — {city}",
+                        f"Liste les transactions à {city}{period_fr}",
+                        f"Détail des dépenses à {city}.",
+                        angle="narrow",
+                    ),
+                    _follow_up_item(
+                        "Par employé",
+                        f"Top employés avec dépenses à {city}{period_fr}",
+                        "Qui dépense dans cette ville ?",
+                        angle="pivot",
+                    ),
+                    _follow_up_item(
+                        "Toutes les villes",
+                        "Montre les dépenses par ville",
+                        "Revenir à une vue globale des villes.",
+                        angle="broaden",
+                    ),
+                ]
+            )
+        else:
+            items.extend(
+                [
+                    _follow_up_item(
+                        f"Transactions — {city}",
+                        f"List recent transactions in {city}{period_en}",
+                        f"Transaction detail in {city}.",
+                        angle="narrow",
+                    ),
+                    _follow_up_item(
+                        "Top spenders",
+                        f"Top employees spending in {city}{period_en}",
+                        "Who spends in this city?",
+                        angle="pivot",
+                    ),
+                    _follow_up_item(
+                        "All cities",
+                        "Show spend by city",
+                        "Back to all cities.",
+                        angle="broaden",
+                    ),
+                ]
+            )
+
+    elif aid == "top_merchants" and merchant:
+        if fr:
+            items.extend(
+                [
+                    _follow_up_item(
+                        f"Transactions — {merchant[:24]}",
+                        f"Liste les transactions chez {merchant}{period_fr}",
+                        "Détail chez ce commerçant.",
+                        angle="narrow",
+                    ),
+                    _follow_up_item(
+                        "Par département",
+                        f"Dépenses par département chez {merchant}{period_fr}",
+                        "Répartition interne.",
+                        angle="pivot",
+                    ),
+                    _follow_up_item(
+                        "Top commerçants",
+                        "Top commerçants par dépenses",
+                        "Classement global.",
+                        angle="broaden",
+                    ),
+                ]
+            )
+        else:
+            items.extend(
+                [
+                    _follow_up_item(
+                        f"At {merchant[:24]}",
+                        f"List transactions at {merchant}{period_en}",
+                        "Drill into this merchant.",
+                        angle="narrow",
+                    ),
+                    _follow_up_item(
+                        "By department",
+                        f"Spend by department at {merchant}{period_en}",
+                        "Internal split.",
+                        angle="pivot",
+                    ),
+                    _follow_up_item(
+                        "Top merchants",
+                        "Show top merchants by spend",
+                        "Company-wide merchant ranking.",
+                        angle="broaden",
+                    ),
+                ]
+            )
+
+    elif aid in ("most_flagged", "repeat_offenders", "split_attempts") and emp:
+        if fr:
+            items.extend(
+                [
+                    _follow_up_item(
+                        f"Dépenses — {emp.split()[0]}",
+                        f"Montre les dépenses de {emp}{period_fr}",
+                        "Contexte financier de l'employé flaggé.",
+                        angle="narrow",
+                    ),
+                    _follow_up_item(
+                        "Par catégorie",
+                        f"Dépenses par catégorie{period_fr}",
+                        "Revenir aux dépenses par type.",
+                        angle="pivot",
+                    ),
+                    _follow_up_item(
+                        "Tentatives de split",
+                        "Montre les tentatives d'achat fractionné ce trimestre",
+                        "Autre angle conformité.",
+                        angle="broaden",
+                    ),
+                ]
+            )
+        else:
+            items.extend(
+                [
+                    _follow_up_item(
+                        f"Spend — {emp.split()[0]}",
+                        f"Show {emp}'s spend{period_en}",
+                        "Financial context for flagged employee.",
+                        angle="narrow",
+                    ),
+                    _follow_up_item(
+                        "Spend by category",
+                        f"Show spend by category{period_en}",
+                        "Pivot back to spend types.",
+                        angle="pivot",
+                    ),
+                    _follow_up_item(
+                        "Split attempts",
+                        "Show split-purchase attempts this quarter",
+                        "Another compliance angle.",
+                        angle="broaden",
+                    ),
+                ]
+            )
+
+    elif aid == "budget_status" and dept:
+        if fr:
+            items.extend(
+                [
+                    _follow_up_item(
+                        f"Dépenses — {dept}",
+                        f"Dépenses du département {dept} ce trimestre",
+                        "Détail du département en dépassement.",
+                        angle="narrow",
+                    ),
+                    _follow_up_item(
+                        "Comparer départements",
+                        f"Compare les dépenses entre {dept} et un autre département",
+                        "Comparer budgets et dépenses.",
+                        angle="pivot",
+                    ),
+                    _follow_up_item(
+                        "Top employés",
+                        "Top 10 employés les plus dépensiers",
+                        "Vue dépenses globale.",
+                        angle="broaden",
+                    ),
+                ]
+            )
+        else:
+            items.extend(
+                [
+                    _follow_up_item(
+                        f"Spend — {dept}",
+                        f"Show {dept} department spend this quarter",
+                        "Drill into over-budget department.",
+                        angle="narrow",
+                    ),
+                    _follow_up_item(
+                        "Compare departments",
+                        f"Compare spend between {dept} and another department",
+                        "Budget vs spend comparison.",
+                        angle="pivot",
+                    ),
+                    _follow_up_item(
+                        "Top spenders",
+                        "Top 10 employee spenders",
+                        "Company-wide spend view.",
+                        angle="broaden",
+                    ),
+                ]
+            )
+
+    if len(items) >= 3:
+        return items[:3]
+
+    # Generic contextual fallbacks when we have entities but no template matched
+    if emp and len(items) < 3:
+        if fr:
+            items.append(
+                _follow_up_item(
+                    f"{emp.split()[0]} — détail",
+                    f"Détail des dépenses de {emp}{period_fr}",
+                    "Zoom employé.",
+                    angle="narrow",
+                )
+            )
+        else:
+            items.append(
+                _follow_up_item(
+                    f"{emp.split()[0]} — detail",
+                    f"Show {emp}'s spend breakdown{period_en}",
+                    "Employee drill-down.",
+                    angle="narrow",
+                )
+            )
+    if dept and len(items) < 3:
+        if fr:
+            items.append(
+                _follow_up_item(
+                    f"Dépenses — {dept}",
+                    f"Top employés dans {dept}{period_fr}",
+                    "Zoom département.",
+                    angle="pivot",
+                )
+            )
+        else:
+            items.append(
+                _follow_up_item(
+                    f"Spend — {dept}",
+                    f"Top spenders in {dept}{period_en}",
+                    "Department drill-down.",
+                    angle="pivot",
+                )
+            )
+
+    if len(items) < 3:
+        present = ctx.get("present") or {"tx"}
+        viz_type = ctx.get("viz_type")
+        chips = suggest_chips(q, present, aid, viz_type=viz_type)
+        for structured in _chips_to_structured(chips, ctx):
+            if len(items) >= 3:
+                break
+            prompts = {i["prompt"] for i in items}
+            if structured["prompt"] not in prompts:
+                items.append(structured)
+
+    present = ctx.get("present") or {"tx"}
+    return items[:3] if items else _chips_to_structured(
+        suggest_chips(q, present, aid, viz_type=ctx.get("viz_type")),
+        ctx,
+    )
+
+
+def _follow_up_schema():
+    from pydantic import BaseModel, Field
+
+    class FollowUpItem(BaseModel):
+        label: str = Field(description="Short chip label, max ~48 characters")
+        prompt: str = Field(description="Full follow-up question sent to the assistant")
+        hint: str = Field(description="One-line tooltip explaining why this is useful")
+        angle: str = Field(description="narrow | pivot | broaden")
+
+    class FollowUpSet(BaseModel):
+        items: list[FollowUpItem] = Field(
+            description="Exactly three diverse follow-up suggestions"
+        )
+
+    return FollowUpSet
+
+
+FOLLOW_UP_SYSTEM = """You suggest exactly three follow-up questions for a finance analytics
+chat. The user just asked a question and received an answer with SQL result rows.
+
+Rules:
+- Return exactly 3 items with angles: one "narrow" (drill into a specific employee,
+  department, merchant, or city from the context), one "pivot" (different dimension:
+  category, department, city, merchants, employees), one "broaden" (wider lens: company-wide
+  ranking, monthly trend, compliance flags, budget status, or all-time) when relevant.
+- Use real entity names from the context (employees, departments, etc.) — never invent names.
+- Each prompt must be answerable using only the available capability areas listed in context.
+- Do NOT repeat the user's last question verbatim.
+- Match the user's language (French questions → French labels and prompts).
+- Labels are short (under 48 chars); prompts are complete questions.
+- If compliance (flags/strikes) or budget data is available, include at least one non-spend
+  angle when it fits the broaden slot.
+
+Context JSON:
+{context_json}"""
+
+
+def _generate_follow_ups_llm_inner(ctx: dict) -> list[dict]:
+    from langchain_core.prompts import ChatPromptTemplate
+
+    chain = (
+        ChatPromptTemplate.from_messages(
+            [("system", FOLLOW_UP_SYSTEM), ("human", "Suggest three follow-ups.")]
+        ).partial(context_json=json.dumps(ctx, ensure_ascii=False, default=str))
+        | make_chat_llm().with_structured_output(_follow_up_schema())
+    )
+    result = chain.invoke({})
+    items = getattr(result, "items", None) or result.get("items", [])
+    out: list[dict] = []
+    for item in items[:3]:
+        if hasattr(item, "model_dump"):
+            data = item.model_dump()
+        elif isinstance(item, dict):
+            data = item
+        else:
+            continue
+        label = str(data.get("label") or "").strip()
+        prompt = str(data.get("prompt") or "").strip()
+        hint = str(data.get("hint") or "").strip()
+        if not label or not prompt:
+            continue
+        out.append(
+            _follow_up_item(
+                label,
+                prompt,
+                hint or prompt,
+                angle=str(data.get("angle") or "pivot"),
+            )
+        )
+    return out if len(out) == 3 else []
+
+
+def generate_follow_ups_llm(ctx: dict) -> list[dict] | None:
+    import concurrent.futures
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_generate_follow_ups_llm_inner, ctx)
+            return future.result(timeout=3.0)
+    except Exception:
+        return None
+
+
+def resolve_follow_ups(
+    question: str,
+    present: set[str],
+    answered_id: str | None,
+    rows: list[dict] | None,
+    *,
+    plan: dict | None = None,
+    viz: dict | None = None,
+    use_llm_for_followups: bool = False,
+) -> list[dict]:
+    """Structured follow-ups: LLM when enabled, else heuristics, else registry chips."""
+    ctx = _follow_up_context(
+        question,
+        present,
+        rows,
+        plan=plan,
+        viz=viz,
+        answered_id=answered_id,
+    )
+    if not rows and not ctx.get("series_names"):
+        return _chips_to_structured(
+            suggest_chips(
+                question,
+                present,
+                answered_id,
+                viz_type=ctx.get("viz_type"),
+            ),
+            ctx,
+        )
+
+    if use_llm_for_followups:
+        llm_items = generate_follow_ups_llm(ctx)
+        if llm_items and len(llm_items) == 3:
+            return llm_items
+
+    contextual = suggest_contextual_follow_ups(ctx)
+    if len(contextual) >= 3:
+        return contextual[:3]
+
+    chips = suggest_chips(
+        question,
+        present,
+        answered_id,
+        viz_type=ctx.get("viz_type"),
+    )
+    merged = contextual + _chips_to_structured(chips, ctx)
+    seen: set[str] = set()
+    out: list[dict] = []
+    for item in merged:
+        key = item["prompt"]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+        if len(out) == 3:
+            break
+    return out
 
 
 # =========================================================================== #
@@ -280,6 +1137,19 @@ def build_db_from_supabase(client, limit: int | None = None) -> tuple[duckdb.Duc
         present.add("budget")
 
     return con, present
+
+
+_ALL_TIME_INTENT_RE = re.compile(
+    r"\b("
+    r"all[- ]?time|entire history|full history|since the beginning|"
+    r"toute la période|historique complet|depuis le début|ever"
+    r")\b",
+    re.I,
+)
+
+
+def _is_all_time_intent(question: str) -> bool:
+    return bool(_ALL_TIME_INTENT_RE.search(question))
 
 
 def format_history(turns: list[dict]) -> str:
@@ -459,13 +1329,18 @@ When the question is about Brim dashboard navigation only (where to click, which
 set in_scope=true and use: SELECT 'dashboard_help' AS topic LIMIT 1 with chart=table and
 title='Brim dashboard'.
 
-Period defaults: assume the current quarter
-(date >= date_trunc('quarter', (SELECT max(date) FROM tx))) ONLY for spend/amount questions
-that omit a period. For counts or lookups of flagged transactions, compliance flags, strikes,
-or approvals — and for "which one / laquelle" follow-ups — do NOT add any date filter unless
-the user names a period; count or list across all data so the answer is stable. Use
-ROUND(SUM(amount),2) for spend comparisons. Filter tx.employee_name when two
-employees are named or when comparing employees.
+Period defaults: table tx is the full loaded dataset — there is no session toolbar filter.
+Add date predicates only when the user names a period in their question (e.g. this quarter,
+last month, all time). Do NOT assume the current quarter when no period is mentioned. For
+counts or lookups of flagged transactions, compliance flags, strikes, or approvals — and for
+"which one / laquelle" follow-ups — do NOT add any date filter unless the user names a period.
+Use ROUND(SUM(amount),2) for spend comparisons. Filter tx.employee_name when two employees
+are named or when comparing employees.
+
+Rankings and breakdowns: for "top N employees/spenders" use GROUP BY employee_name,
+ORDER BY ROUND(SUM(amount),2) DESC, LIMIT N (default 10). For top departments use GROUP BY
+department; for categories use brim_category; for cities use city. Use chart=bar or table for
+ranked lists. Do not return a single-row KPI when the user asked for a top/ranked list.
 
 {schema}
 
@@ -477,7 +1352,8 @@ result rows (JSON), write a concise 1-3 sentence answer for a non-technical fina
 Reference the actual numbers. Do not invent data beyond the rows. No preamble.
 Report only what the rows contain: if the question asks for N items (e.g. "top 3") but fewer
 rows are returned, describe exactly the rows present and never state a higher count than the
-rows support. Match any count you mention to the number of rows."""
+rows support. Match any count you mention to the number of rows. For ranked employee lists,
+name every employee row returned (up to the limit), not only the first."""
 
 
 def make_llm_steps(schema: str, history: str):
@@ -487,6 +1363,9 @@ def make_llm_steps(schema: str, history: str):
 
     plan_chain = ChatPromptTemplate.from_messages(
         [("system", PLAN_SYSTEM), ("human", "{question}")]
+    ).partial(
+        schema=schema,
+        history=history or "(none)",
     ) | make_chat_llm().with_structured_output(_plan_schema())
 
     repair_chain = ChatPromptTemplate.from_messages([
@@ -499,7 +1378,7 @@ def make_llm_steps(schema: str, history: str):
     ) | make_chat_llm()
 
     def plan(question: str) -> dict:
-        p = plan_chain.invoke({"schema": schema, "history": history or "(none)", "question": question})
+        p = plan_chain.invoke({"question": question})
         chart = p.chart if p.chart in CHART_TYPES else "table"
         return {
             "in_scope": p.in_scope,
@@ -748,7 +1627,9 @@ def _scoped_result(
 ) -> dict:
     return {
         "text": text,
-        "followUpSuggestions": suggest_chips(question, present, answered_id),
+        "followUpSuggestions": resolve_follow_ups(
+            question, present, answered_id, None
+        ),
         "sql": sql,
     }
 
@@ -903,6 +1784,8 @@ def _plan_location_spend(question: str, con) -> dict | None:
 
 def _period_clause(question: str) -> str:
     """A small set of relative periods, computed off the latest transaction date."""
+    if _is_all_time_intent(question):
+        return ""
     q = question.lower()
     mx = "(SELECT max(date) FROM tx)"
     if "last quarter" in q:
@@ -921,11 +1804,7 @@ def _period_clause(question: str) -> str:
 
 
 def _default_period_clause(question: str) -> str:
-    explicit = _period_clause(question)
-    if explicit:
-        return explicit
-    mx = "(SELECT max(date) FROM tx)"
-    return f"date >= date_trunc('quarter', {mx})"
+    return _period_clause(question)
 
 
 def _where_with_period(question: str) -> str:
@@ -993,6 +1872,24 @@ def _plan_employee_compare(question: str, con) -> dict | None:
     return None
 
 
+def _parse_top_n(question: str, default: int = 10) -> int:
+    match = re.search(r"\btop\s*(\d+)\b", question, re.I)
+    if match:
+        return max(1, min(50, int(match.group(1))))
+    return default
+
+
+def _is_top_employees_intent(question: str) -> bool:
+    q = question.lower()
+    if re.search(r"\btop\s*\d*\s*(employee|employé|employe|spender)", q):
+        return True
+    if re.search(r"(employee|employé|employe).*(top|spender|spend)", q):
+        return True
+    if re.search(r"\bspender", q) and ("employee" in q or "employ" in q):
+        return True
+    return False
+
+
 def mock_plan(question: str, present: set[str], con) -> dict:
     q = question.lower()
     period = _default_period_clause(question)
@@ -1001,6 +1898,21 @@ def mock_plan(question: str, present: set[str], con) -> dict:
     employee_compare = _plan_employee_compare(question, con)
     if employee_compare:
         return employee_compare
+
+    if _is_top_employees_intent(question):
+        n = _parse_top_n(question, 10)
+        period_clause = period
+        clauses = [c for c in (period_clause, "employee_name IS NOT NULL") if c]
+        w = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return {
+            "id": "top_employees",
+            "chart": "bar",
+            "title": f"Top {n} employee spenders",
+            "sql": (
+                f"SELECT employee_name, ROUND(SUM(amount),2) AS total FROM tx{w} "
+                f"GROUP BY employee_name ORDER BY total DESC LIMIT {n}"
+            ),
+        }
 
     if "split" in q and "flags" in present:
         return {"id": "split_attempts", "chart": "table", "title": "Split-purchase attempts",
@@ -1043,6 +1955,62 @@ def mock_plan(question: str, present: set[str], con) -> dict:
     location_spend = _plan_location_spend(question, con)
     if location_spend:
         return location_spend
+
+    if re.search(r"total\s+(company\s+)?spend|overall\s+spend|company\s+spend", q) and not re.search(
+        r"\bby\b|\bper\b|department|employee|city|ville", q
+    ):
+        clauses = [c for c in (period,) if c]
+        w = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return {
+            "id": "total_spend",
+            "chart": "kpi",
+            "title": "Total company spend",
+            "sql": f"SELECT ROUND(SUM(amount),2) AS total FROM tx{w}",
+        }
+
+    if re.search(r"\b(city|cities|ville)\b", q) and re.search(
+        r"spend|spent|top|breakdown|by", q
+    ) and not _is_spend_location_intent(question, con):
+        n = _parse_top_n(question, 10)
+        clauses = [c for c in (period, "city IS NOT NULL") if c]
+        w = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return {
+            "id": "spend_by_city",
+            "chart": "bar",
+            "title": f"Top {n} cities by spend",
+            "sql": (
+                f"SELECT city, ROUND(SUM(amount),2) AS total FROM tx{w} "
+                f"GROUP BY city ORDER BY total DESC LIMIT {n}"
+            ),
+        }
+
+    if re.search(r"category|brim_category|mcc", q) and re.search(r"spend|spent|breakdown|by", q):
+        clauses = [c for c in (period,) if c]
+        w = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return {
+            "id": "spend_by_category",
+            "chart": "bar",
+            "title": "Spend by category",
+            "sql": (
+                f"SELECT brim_category, ROUND(SUM(amount),2) AS total FROM tx{w} "
+                f"GROUP BY brim_category ORDER BY total DESC"
+            ),
+        }
+
+    if re.search(r"department|dept|département", q) and re.search(
+        r"spend|spent|breakdown|by", q
+    ) and not re.search(r"compare|versus|\bvs\b", q):
+        clauses = [c for c in (period,) if c]
+        w = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        return {
+            "id": "spend_by_department",
+            "chart": "bar",
+            "title": "Spend by department",
+            "sql": (
+                f"SELECT department, ROUND(SUM(amount),2) AS total FROM tx{w} "
+                f"GROUP BY department ORDER BY total DESC"
+            ),
+        }
 
     # default: spend by department & category, honoring any department/category/period filter
     dept = _match_department(question, con)
@@ -1214,19 +2182,58 @@ def _status_event(phase: str, question: str) -> dict:
 
 
 class _AnswerResult:
-    def __init__(self, question: str, present: set[str], *, visualization: dict | None = None,
-                 sql: str | None = None, error: str | None = None,
-                 answered_id: str | None = None, degraded: bool = False):
+    def __init__(
+        self,
+        question: str,
+        present: set[str],
+        *,
+        visualization: dict | None = None,
+        sql: str | None = None,
+        error: str | None = None,
+        answered_id: str | None = None,
+        degraded: bool = False,
+        rows: list[dict] | None = None,
+        plan: dict | None = None,
+        use_llm_for_followups: bool = False,
+        skip_follow_ups: bool = False,
+    ):
         self.question = question
+        self.present = present
         self.visualization = visualization
         self.sql = sql
         self.error = error
         self.degraded = degraded
-        self.follow_ups = suggest_chips(question, present, answered_id)
+        self.answered_id = answered_id
+        self.rows = rows or []
+        self.plan = plan
+        self.use_llm_for_followups = use_llm_for_followups
+        self.skip_follow_ups = skip_follow_ups
+        self._follow_ups_cache: list[dict] | None = None
         self._viz_events = (
             [{"type": "visualization", "visualization": visualization}]
             if visualization is not None else []
         )
+
+    def _resolve_follow_ups(self) -> list[dict]:
+        if self._follow_ups_cache is not None:
+            return self._follow_ups_cache
+        if self.skip_follow_ups:
+            self._follow_ups_cache = []
+            return self._follow_ups_cache
+        self._follow_ups_cache = resolve_follow_ups(
+            self.question,
+            self.present,
+            self.answered_id,
+            self.rows,
+            plan=self.plan,
+            viz=self.visualization,
+            use_llm_for_followups=self.use_llm_for_followups,
+        )
+        return self._follow_ups_cache
+
+    @property
+    def follow_ups(self) -> list[dict]:
+        return self._resolve_follow_ups()
 
     @property
     def text(self) -> str:
@@ -1238,14 +2245,16 @@ class _AnswerResult:
     def stream(self):
         yield from self._viz_events
         yield from self._text_events()
-        yield {"type": "follow_up", "suggestions": self.follow_ups}
+        follow_ups = self._resolve_follow_ups()
+        if follow_ups:
+            yield {"type": "follow_up", "suggestions": follow_ups}
         yield {"type": "done"}
 
     def to_dict(self) -> dict:
         return {
             "text": self.text,
             "visualization": self.visualization,
-            "followUpSuggestions": self.follow_ups,
+            "followUpSuggestions": self._resolve_follow_ups(),
             "sql": self.sql,
             "_error": self.error,
             "_degraded": self.degraded,
@@ -1295,13 +2304,21 @@ class NarratedAnswer(_AnswerResult):
 
 def _mock_static_answer(con, present: set[str], question: str, on_status) -> _AnswerResult | None:
     if _is_off_topic(question):
-        return StaticAnswer(off_topic_refusal(question), question, present)
+        return StaticAnswer(
+            off_topic_refusal(question), question, present, skip_follow_ups=True
+        )
     if _is_casual_chat(question):
-        return StaticAnswer(_mock_greeting(question), question, present)
+        return StaticAnswer(
+            _mock_greeting(question), question, present, skip_follow_ups=True
+        )
     if _is_ambiguous(question):
-        return StaticAnswer(_mock_clarification(question), question, present)
+        return StaticAnswer(
+            _mock_clarification(question), question, present, skip_follow_ups=True
+        )
     if _is_dashboard_help(question):
-        return StaticAnswer(_mock_dashboard_help(question), question, present)
+        return StaticAnswer(
+            _mock_dashboard_help(question), question, present, skip_follow_ups=True
+        )
 
     on_status("planning")
     plan = mock_plan(question, present, con)
@@ -1317,8 +2334,19 @@ def _mock_static_answer(con, present: set[str], question: str, on_status) -> _An
     chart = plan["chart"] if err is None else "table"
     viz = build_visualization(chart, plan["title"], df)
     text = mock_narrate(question, df, plan) if err is None else _COMPUTE_FAIL_MOCK
-    return StaticAnswer(text, question, present, visualization=viz,
-                        sql=sql_used, error=err, answered_id=plan.get("id"))
+    rows = _records(df) if err is None else []
+    return StaticAnswer(
+        text,
+        question,
+        present,
+        visualization=viz,
+        sql=sql_used,
+        error=err,
+        answered_id=plan.get("id"),
+        rows=rows,
+        plan=plan,
+        use_llm_for_followups=False,
+    )
 
 
 def _llm_answer(
@@ -1327,16 +2355,24 @@ def _llm_answer(
     question: str,
     history: str,
     on_status,
+    *,
+    use_llm_for_followups: bool = True,
 ) -> _AnswerResult:
     schema = schema_doc(present)
     if _is_casual_chat(question):
-        return StaticAnswer(_mock_greeting(question), question, present)
+        return StaticAnswer(
+            _mock_greeting(question), question, present, skip_follow_ups=True
+        )
 
     on_status("planning")
-    plan_fn, repair_factory, narrate_fn, narrate_stream_fn = make_llm_steps(schema, history)
+    plan_fn, repair_factory, narrate_fn, narrate_stream_fn = make_llm_steps(
+        schema, history
+    )
     plan = plan_fn(question)
     if not plan.get("in_scope", True):
-        return StaticAnswer(off_topic_refusal(question), question, present)
+        return StaticAnswer(
+            off_topic_refusal(question), question, present, skip_follow_ups=True
+        )
 
     on_status("running_query")
     repair_phases: list[str] = []
@@ -1363,7 +2399,13 @@ def _llm_answer(
     return NarratedAnswer(
         lambda: narrate_stream_fn(question, rows),
         lambda: narrate_fn(question, rows),
-        question, present, visualization=viz, sql=sql_used,
+        question,
+        present,
+        visualization=viz,
+        sql=sql_used,
+        rows=rows,
+        plan=plan,
+        use_llm_for_followups=use_llm_for_followups,
     )
 
 
@@ -1375,29 +2417,55 @@ def _resolve_answer(
     use_llm: bool,
     *,
     on_status=None,
+    use_llm_for_followups: bool | None = None,
 ) -> _AnswerResult:
     def status(phase: str) -> None:
         if on_status is not None:
             on_status(phase)
 
+    followups_llm = use_llm if use_llm_for_followups is None else use_llm_for_followups
+
     if not use_llm:
         mock_result = _mock_static_answer(con, present, question, status)
         if mock_result is not None:
             return mock_result
-    return _llm_answer(con, present, question, history, status)
+    return _llm_answer(
+        con,
+        present,
+        question,
+        history,
+        status,
+        use_llm_for_followups=followups_llm,
+    )
 
 
-def _resolve_answer_stream(con, present: set[str], question: str, history: str, use_llm: bool):
+def _resolve_answer_stream(
+    con,
+    present: set[str],
+    question: str,
+    history: str,
+    use_llm: bool,
+    *,
+    use_llm_for_followups: bool | None = None,
+):
     """Yield status events in real time; return the final _AnswerResult via StopIteration."""
     if not use_llm:
         if _is_off_topic(question):
-            return StaticAnswer(off_topic_refusal(question), question, present)
+            return StaticAnswer(
+                off_topic_refusal(question), question, present, skip_follow_ups=True
+            )
         if _is_casual_chat(question):
-            return StaticAnswer(_mock_greeting(question), question, present)
+            return StaticAnswer(
+                _mock_greeting(question), question, present, skip_follow_ups=True
+            )
         if _is_ambiguous(question):
-            return StaticAnswer(_mock_clarification(question), question, present)
+            return StaticAnswer(
+                _mock_clarification(question), question, present, skip_follow_ups=True
+            )
         if _is_dashboard_help(question):
-            return StaticAnswer(_mock_dashboard_help(question), question, present)
+            return StaticAnswer(
+                _mock_dashboard_help(question), question, present, skip_follow_ups=True
+            )
 
         yield _status_event("planning", question)
         plan = mock_plan(question, present, con)
@@ -1413,15 +2481,30 @@ def _resolve_answer_stream(con, present: set[str], question: str, history: str, 
         chart = plan["chart"] if err is None else "table"
         viz = build_visualization(chart, plan["title"], df)
         text = mock_narrate(question, df, plan) if err is None else _COMPUTE_FAIL_MOCK
-        return StaticAnswer(text, question, present, visualization=viz,
-                            sql=sql_used, error=err, answered_id=plan.get("id"))
+        rows = _records(df) if err is None else []
+        return StaticAnswer(
+            text,
+            question,
+            present,
+            visualization=viz,
+            sql=sql_used,
+            error=err,
+            answered_id=plan.get("id"),
+            rows=rows,
+            plan=plan,
+            use_llm_for_followups=False,
+        )
 
     if _is_casual_chat(question):
-        return StaticAnswer(_mock_greeting(question), question, present)
+        return StaticAnswer(
+            _mock_greeting(question), question, present, skip_follow_ups=True
+        )
 
     schema = schema_doc(present)
     yield _status_event("planning", question)
-    plan_fn, repair_factory, narrate_fn, narrate_stream_fn = make_llm_steps(schema, history)
+    plan_fn, repair_factory, narrate_fn, narrate_stream_fn = make_llm_steps(
+        schema, history
+    )
     plan = plan_fn(question)
     if not plan.get("in_scope", True):
         return StaticAnswer(off_topic_refusal(question), question, present)
@@ -1448,15 +2531,37 @@ def _resolve_answer_stream(con, present: set[str], question: str, history: str, 
         return StaticAnswer(text, question, present, visualization=viz, sql=sql_used, error=err)
 
     viz = build_visualization(plan["chart"], plan["title"], df)
+    followups_llm = use_llm if use_llm_for_followups is None else use_llm_for_followups
     return NarratedAnswer(
         lambda: narrate_stream_fn(question, rows),
         lambda: narrate_fn(question, rows),
-        question, present, visualization=viz, sql=sql_used,
+        question,
+        present,
+        visualization=viz,
+        sql=sql_used,
+        rows=rows,
+        plan=plan,
+        use_llm_for_followups=followups_llm,
     )
 
 
-def prepare_answer(con, present: set[str], question: str, history: str, use_llm: bool) -> _AnswerResult:
-    return _resolve_answer(con, present, question, history, use_llm)
+def prepare_answer(
+    con,
+    present: set[str],
+    question: str,
+    history: str,
+    use_llm: bool,
+    *,
+    use_llm_for_followups: bool | None = None,
+) -> _AnswerResult:
+    return _resolve_answer(
+        con,
+        present,
+        question,
+        history,
+        use_llm,
+        use_llm_for_followups=use_llm_for_followups,
+    )
 
 
 def stream_answer_events(
@@ -1467,12 +2572,21 @@ def stream_answer_events(
     use_llm: bool,
     *,
     degraded: bool = False,
+    use_llm_for_followups: bool | None = None,
 ):
     """SSE generator: status events during prep, then result.stream()."""
     if degraded:
         yield _status_event("degraded", question)
 
-    gen = _resolve_answer_stream(con, present, question, history, use_llm)
+    followups_llm = False if degraded else use_llm_for_followups
+    gen = _resolve_answer_stream(
+        con,
+        present,
+        question,
+        history,
+        use_llm,
+        use_llm_for_followups=followups_llm,
+    )
     result = None
     while True:
         try:
@@ -1484,7 +2598,13 @@ def stream_answer_events(
         yield from result.stream()
 
 
-def answer(con, present: set[str], question: str, history: str, use_llm: bool) -> dict:
+def answer(
+    con,
+    present: set[str],
+    question: str,
+    history: str,
+    use_llm: bool,
+) -> dict:
     return prepare_answer(con, present, question, history, use_llm).to_dict()
 
 
