@@ -2,7 +2,7 @@
 
 ## Stack
 
-Next.js 14 API Routes, Supabase (DB + Auth + Realtime), Google Gemini API, Resend (emails). Moteur de rapports (Feature 4) en Python : pandas + LangChain (`langchain-google-genai`) + pydantic (voir `feature4.py`).
+Next.js 14 API Routes, Supabase (DB + Auth + Realtime), Google Gemini API, Resend (emails). Moteurs Python (features 1/2/4) : pandas + LangChain (`langchain-google-genai`) + pydantic, plus DuckDB pour le text-to-SQL de Feature 1 (voir `feature1.py`, `feature2.py`, `feature4.py`).
 
 ---
 
@@ -31,7 +31,7 @@ Next.js 14 API Routes, Supabase (DB + Auth + Realtime), Google Gemini API, Resen
 
 ### `POST /api/assistant`
 
-Point d'entrée du Brim Assistant. Reçoit l'historique complet de la conversation + un contexte optionnel (plage de dates, départements). Avant d'appeler Gemini, interroge Supabase pour récupérer les transactions pertinentes, les policies actives, et les informations des employés concernés, puis les injecte dans le system prompt. Gemini retourne un objet structuré `{ text, visualization: { type, title, data }, followUpSuggestions }`. Le type de visualisation (bar, line, pie, table, kpi) est choisi par Gemini selon la nature de la question.
+Point d'entrée du Brim Assistant, servi par le **moteur Feature 1** (`feature1.py`, voir plus bas). Reçoit l'historique de la conversation + un contexte optionnel. Plutôt que d'injecter les transactions dans le prompt (qui ne passe pas à l'échelle sur des milliers de lignes), Gemini **génère une requête SQL** que le serveur exécute en lecture seule contre les données (DuckDB en local / Supabase en prod), s'auto-corrige en cas d'erreur, puis rédige la réponse. Retourne `{ text, visualization: { type, title, data }, followUpSuggestions, sql }`. Le type de visualisation (bar, line, pie, table, kpi) suit la forme du résultat ; les `followUpSuggestions` proviennent d'un registre de capacités testées (puces toujours répondables), la saisie restant libre.
 
 ### `POST /api/compliance/scan`
 
@@ -59,6 +59,30 @@ Deux modes, tous deux servis par le **moteur Feature 4** (`feature4.py`, voir pl
 ### `POST /api/webhooks/supabase`
 
 Déclenché par un trigger Supabase à chaque INSERT dans `transactions`. Lance en parallèle : le scan compliance, la vérification du seuil d'approbation (si `amount` dépasse le seuil défini dans les policies, crée une entrée dans `approval_requests` et notifie l'approver), et la logique de groupement (assigne un `event_group_id` basé sur la proximité temporelle, la localisation, et l'employé). Le groupement et la génération de rapport sont délégués au moteur Feature 4 ci-dessous.
+
+---
+
+## Feature 1 — Assistant « Talk to Your Data » (`feature1.py`)
+
+Moteur de Q&R **agentique text-to-SQL**. Même stack/conventions que F2/F4 (réutilise les loaders + le mapping MCC de `feature4.py`), `--mock-llm` + dégradation gracieuse (jamais d'échec dur). Les chiffres viennent d'une **vraie agrégation SQL**, pas du LLM.
+
+**Modèle d'interaction.** Texte libre à tout moment. Les *choix* de suivi (`followUpSuggestions`) proviennent d'un **registre de capacités battle-tested** — chaque puce mappe une requête connue-bonne, donc une puce suggérée est toujours répondable, tandis que la saisie reste libre.
+
+**Pipeline** (la « profondeur IA » — pas un wrapper mono-prompt) :
+1. **PLAN** — Gemini → `{sql, chart, title}` (sortie structurée) depuis la question + l'historique + le schéma.
+2. **GUARD** — rejette tout sauf un unique `SELECT`/`WITH` lecture seule ; injecte un `LIMIT`.
+3. **EXECUTE** — DuckDB sur `tx` (transactions enrichies : `employee_name`, `department`, `brim_category`) ⋈ `budget`, `flags`, `strikes`.
+4. **REPAIR** — sur erreur SQL, renvoie l'erreur à Gemini (jusqu'à 2 fois) → boucle agentique auto-correctrice.
+5. **NARRATE** — Gemini transforme les lignes en réponse 1–3 phrases ; la viz (`bar|line|pie|table|kpi`) suit la forme du résultat.
+
+Sortie = le contrat `/api/assistant` : `{ text, visualization{type,title,data}, followUpSuggestions, sql }` (`sql` renvoyé pour la transparence). Le moteur ne décrit au LLM que les tables **présentes**, donc l'assistant couvre aussi bien les dépenses que la **surveillance / fraude** (« qui a le plus de flags ? », « récidivistes », « tentatives de split ») — sans dupliquer de détection (c'est le rôle de Feature 2 ; F1 ne fait qu'interroger ses sorties `flags`/`strikes`).
+
+```
+py feature1.py --transactions transactions.csv --employees employees.csv \
+    --departments departments.csv --budgets budgets.csv --flags transaction_flags.csv \
+    --strikes employee_strikes.csv --question "Qu'a dépensé Marketing en logiciel le trimestre dernier ?"
+py feature1.py --transactions transactions.csv --question "Top merchants this month" --mock-llm
+```
 
 ---
 
