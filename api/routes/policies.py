@@ -9,16 +9,18 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from api.compliance_service import execute_compliance_scan
 from api.deps import supabase_client
 from api.policy_import import (
     PdfTextExtractionError,
     PdfValidationError,
+    assign_policy_ids,
     decode_pdf_base64,
     extract_policies_from_text,
     extract_text_from_pdf,
 )
 from api.supabase_io import (
-    deactivate_policy,
+    delete_policy as delete_policy_row,
     insert_policies,
     list_policies,
     upsert_policy,
@@ -58,13 +60,32 @@ class PolicyImportConfirmBody(BaseModel):
     policies: list[PolicyBody]
 
 
+def _maybe_rescan(
+    client,
+    *,
+    rescan: bool,
+    mock_llm: bool,
+) -> dict[str, Any] | None:
+    if not rescan:
+        return None
+    try:
+        return execute_compliance_scan(client, mock_llm=mock_llm, replace=True)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
 @router.get("")
 def get_policies(client=Depends(supabase_client)) -> list[dict[str, Any]]:
     return list_policies(client)
 
 
 @router.post("")
-def create_policy(body: PolicyBody, client=Depends(supabase_client)) -> dict[str, Any]:
+def create_policy(
+    body: PolicyBody,
+    rescan: bool = Query(True, description="Re-run compliance scan after policy change"),
+    mock_llm: bool = Query(False, alias="mock_llm"),
+    client=Depends(supabase_client),
+) -> dict[str, Any]:
     row = {
         "id": f"pol-{uuid.uuid4().hex[:8]}",
         "policy_name": body.policy_name,
@@ -72,13 +93,19 @@ def create_policy(body: PolicyBody, client=Depends(supabase_client)) -> dict[str
         "effective_date": body.effective_date,
         "active": body.active,
     }
-    return upsert_policy(client, row)
+    created = upsert_policy(client, row)
+    scan = _maybe_rescan(client, rescan=rescan, mock_llm=mock_llm)
+    if scan is not None:
+        created = {**created, "rescan": scan}
+    return created
 
 
 @router.patch("/{policy_id}")
 def update_policy(
     policy_id: str,
     body: PolicyPatchBody,
+    rescan: bool = Query(True, description="Re-run compliance scan after policy change"),
+    mock_llm: bool = Query(False, alias="mock_llm"),
     client=Depends(supabase_client),
 ) -> dict[str, Any]:
     updates: dict[str, Any] = {}
@@ -96,16 +123,33 @@ def update_policy(
     res = client.table("policies").update(updates).eq("id", policy_id).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail=f"Policy {policy_id} not found")
-    return res.data[0]
+    row = res.data[0]
+    affects_compliance = (
+        body.policy_requirements is not None or body.active is not None
+    )
+    if affects_compliance:
+        scan = _maybe_rescan(client, rescan=rescan, mock_llm=mock_llm)
+        if scan is not None:
+            row = {**row, "rescan": scan}
+    return row
 
 
 @router.delete("/{policy_id}")
-def delete_policy(policy_id: str, client=Depends(supabase_client)) -> dict[str, Any]:
+def delete_policy(
+    policy_id: str,
+    rescan: bool = Query(True, description="Re-run compliance scan after policy change"),
+    mock_llm: bool = Query(False, alias="mock_llm"),
+    client=Depends(supabase_client),
+) -> dict[str, Any]:
     try:
-        row = deactivate_policy(client, policy_id)
+        delete_policy_row(client, policy_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return {"id": policy_id, "active": row.get("active", False)}
+    out: dict[str, Any] = {"id": policy_id, "deleted": True}
+    scan = _maybe_rescan(client, rescan=rescan, mock_llm=mock_llm)
+    if scan is not None:
+        out["rescan"] = scan
+    return out
 
 
 @router.post("/import")
@@ -136,18 +180,20 @@ def import_policies_preview(
         content = (body.content or "").strip()
 
     use_llm = not mock_llm
-    policies = extract_policies_from_text(content, use_llm=use_llm)
+    policies = assign_policy_ids(extract_policies_from_text(content, use_llm=use_llm))
     if not policies:
         raise HTTPException(
             status_code=422,
             detail="No policy rules could be extracted from the document",
         )
-    return {"policies": policies}
+    return {"policies": policies, "count": len(policies)}
 
 
 @router.post("/import/confirm")
 def import_policies_confirm(
     body: PolicyImportConfirmBody,
+    rescan: bool = Query(True, description="Re-run compliance scan after policy change"),
+    mock_llm: bool = Query(False, alias="mock_llm"),
     client=Depends(supabase_client),
 ) -> dict[str, Any]:
     rows = [
@@ -161,4 +207,8 @@ def import_policies_confirm(
         for p in body.policies
     ]
     inserted = insert_policies(client, rows)
-    return {"count": len(inserted), "policies": inserted}
+    out: dict[str, Any] = {"count": len(inserted), "policies": inserted}
+    scan = _maybe_rescan(client, rescan=rescan, mock_llm=mock_llm)
+    if scan is not None:
+        out["rescan"] = scan
+    return out

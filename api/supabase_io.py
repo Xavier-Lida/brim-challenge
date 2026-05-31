@@ -187,11 +187,49 @@ def strikes_dict_from_db(client) -> dict[str, dict]:
     return strikes_from_df(strikes_df) if not strikes_df.empty else {}
 
 
-def persist_compliance_output(client, output: dict) -> dict:
-    """Insert flags, strikes, notifications; return counts."""
+def clear_compliance_artifacts(client, transaction_ids: list[str]) -> dict[str, int]:
+    """Remove prior flags and flag notifications for transactions about to be rescanned."""
+    if not transaction_ids:
+        return {"flags_deleted": 0, "notifications_deleted": 0}
+
+    flags_res = (
+        client.table("transaction_flags")
+        .delete()
+        .in_("transaction_id", transaction_ids)
+        .execute()
+    )
+    flags_deleted = len(flags_res.data or [])
+
+    notif_res = (
+        client.table("notifications")
+        .delete()
+        .eq("type", "flag")
+        .in_("reference_id", transaction_ids)
+        .execute()
+    )
+    notifications_deleted = len(notif_res.data or [])
+
+    return {
+        "flags_deleted": flags_deleted,
+        "notifications_deleted": notifications_deleted,
+    }
+
+
+def persist_compliance_output(
+    client,
+    output: dict,
+    *,
+    transaction_ids: list[str] | None = None,
+    replace: bool = True,
+) -> dict:
+    """Insert flags, strikes, notifications; optionally clear prior flags for scanned txs."""
     flags = output.get("transaction_flags") or []
     strikes = output.get("employee_strikes") or []
     notifications = output.get("notifications") or []
+
+    cleared: dict[str, int] = {}
+    if replace and transaction_ids:
+        cleared = clear_compliance_artifacts(client, transaction_ids)
 
     inserted_flags = 0
     if flags:
@@ -209,6 +247,8 @@ def persist_compliance_output(client, output: dict) -> dict:
         inserted_notifications = len(notifications)
 
     return {
+        "flags_deleted": cleared.get("flags_deleted", 0),
+        "notifications_deleted": cleared.get("notifications_deleted", 0),
         "flags_inserted": inserted_flags,
         "strikes_inserted": inserted_strikes,
         "notifications_upserted": inserted_notifications,
@@ -240,12 +280,24 @@ def apply_decision_to_supabase(client, result: dict) -> None:
 
 
 def persist_reports_output(client, assignments: list[dict], reports: list[dict]) -> dict:
-    updated_groups = 0
+    # Persist all transaction -> event_group_id assignments in a SINGLE round-trip via
+    # the apply_event_groups() RPC. The old code did one UPDATE per transaction, which
+    # meant thousands of sequential HTTP calls and a 60s gateway timeout on batch runs.
+    by_group: dict[str, list[str]] = {}
     for item in assignments:
-        client.table("transactions").update(
-            {"event_group_id": item["event_group_id"]}
-        ).eq("id", item["transaction_id"]).execute()
-        updated_groups += 1
+        by_group.setdefault(item["event_group_id"], []).append(str(item["transaction_id"]))
+
+    updated_groups = 0
+    if assignments:
+        try:
+            client.rpc("apply_event_groups", {"assignments": assignments}).execute()
+            updated_groups = len(assignments)
+        except Exception:  # noqa: BLE001 — RPC not installed yet: fall back to grouped updates
+            for group_id, tids in by_group.items():
+                client.table("transactions").update(
+                    {"event_group_id": group_id}
+                ).in_("id", tids).execute()
+            updated_groups = len(assignments)
 
     inserted_reports = 0
     clean_reports = [{k: v for k, v in r.items() if not k.startswith("_")} for r in reports]
@@ -253,7 +305,11 @@ def persist_reports_output(client, assignments: list[dict], reports: list[dict])
         client.table("expense_reports").upsert(clean_reports, on_conflict="id").execute()
         inserted_reports = len(clean_reports)
 
-    return {"event_groups_updated": updated_groups, "reports_upserted": inserted_reports}
+    return {
+        "event_groups_updated": updated_groups,
+        "event_group_count": len(by_group),
+        "reports_upserted": inserted_reports,
+    }
 
 
 def employee_name_map(client) -> dict[str, str]:
@@ -471,6 +527,13 @@ def deactivate_policy(client, policy_id: str) -> dict:
     if not res.data:
         raise KeyError(f"Policy {policy_id} not found")
     return res.data[0]
+
+
+def delete_policy(client, policy_id: str) -> None:
+    """Permanently remove a policy row (use PATCH active=false to disable only)."""
+    res = client.table("policies").delete().eq("id", policy_id).execute()
+    if not res.data:
+        raise KeyError(f"Policy {policy_id} not found")
 
 
 def list_notifications(client, unread_only: bool = False) -> list[dict]:

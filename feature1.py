@@ -1420,7 +1420,7 @@ def main() -> int:
     ap.add_argument("--budgets", default=None)
     ap.add_argument("--flags", default=None)
     ap.add_argument("--strikes", default=None)
-    ap.add_argument("--model", default=None, help="Gemini model id (default gemini-2.5-flash).")
+    ap.add_argument("--model", default=None, help="Gemini model id (default gemini-3.1-flash-lite).")
     ap.add_argument("--limit", type=int, default=None, help="Only load the first N transactions.")
     ap.add_argument("--mock-llm", action="store_true", help="No API calls (deterministic planner).")
     ap.add_argument("--out", default=None, help="Write JSON here (default stdout).")
@@ -1434,7 +1434,7 @@ def main() -> int:
     use_llm = not args.mock_llm
     try:
         result = answer(con, present, args.question, history, use_llm)
-        mode = (os.getenv("GEMINI_MODEL", "gemini-2.5-flash") if use_llm else "mock")
+        mode = (os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite") if use_llm else "mock")
     except Exception as exc:  # noqa: BLE001 — never hard-fail; degrade to deterministic
         print(f"[LLM unavailable: {exc}] -> deterministic fallback", file=sys.stderr)
         result = answer(con, present, args.question, history, use_llm=False)

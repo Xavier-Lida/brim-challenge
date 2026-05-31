@@ -575,7 +575,7 @@ def main() -> int:
     ap.add_argument("--mcc", default="mcc_codes.csv")
     ap.add_argument("--employees", default=None)
     ap.add_argument("--departments", default=None)
-    ap.add_argument("--model", default=None, help="Gemini model id (default gemini-2.5-flash).")
+    ap.add_argument("--model", default=None, help="Gemini model id (default gemini-3.1-flash-lite).")
     ap.add_argument("--approval-threshold", type=float, default=None, help="Override the approval threshold (CAD).")
     ap.add_argument("--limit", type=int, default=None, help="Only process the first N transactions.")
     ap.add_argument("--mock-llm", action="store_true", help="No API calls (deterministic verdicts).")
@@ -597,7 +597,7 @@ def main() -> int:
     use_llm = not args.mock_llm
     try:
         out = run(df, policy, use_llm)
-        mode = (os.getenv("GEMINI_MODEL", "gemini-2.5-flash") if use_llm else "mock")
+        mode = (os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite") if use_llm else "mock")
     except Exception as exc:  # noqa: BLE001 — never hard-fail; degrade to deterministic
         print(f"[LLM unavailable: {exc}] -> deterministic fallback", file=sys.stderr)
         out = run(df, policy, use_llm=False)

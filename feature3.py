@@ -69,7 +69,7 @@ except ImportError:
 # Config
 # =========================================================================== #
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
 APPROVAL_THRESHOLD_CAD = 1000.0   # amount over this needs approval (override via --threshold)
 FLAG_NOTIFY_WEIGHT = 3            # a flag at/above this weight triggers an approver email
 DENY_WEIGHT = 4                   # a flag at/above this weight is a clear violation
@@ -613,7 +613,7 @@ def main() -> int:
                     help=f"amount over this needs approval (default {APPROVAL_THRESHOLD_CAD:g} CAD).")
     ap.add_argument("--approver-to", default=os.getenv("APPROVER_EMAIL", "approver@company.com"))
     ap.add_argument("--from-addr", default=os.getenv("RESEND_FROM", "Brim <noreply@company.com>"))
-    ap.add_argument("--model", default=None, help="Gemini model id (default gemini-2.5-flash).")
+    ap.add_argument("--model", default=None, help="Gemini model id (default gemini-3.1-flash-lite).")
     ap.add_argument("--mock-llm", action="store_true", help="No API calls (deterministic recommendation).")
     ap.add_argument("--send", action="store_true", help="Also send emails directly via Resend (needs RESEND_API_KEY).")
     ap.add_argument("--decide", default=None, metavar="TRANSACTION_ID",
