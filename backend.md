@@ -62,7 +62,15 @@ GET retourne les flags enrichis (transaction, employé, `reviewed`). PATCH marqu
 
 ### `POST /api/policies/import`
 
-Reçoit un PDF (base64) ou du texte brut. Le moteur [`api/policy_import.py`](api/policy_import.py) découpe le document par sections, appelle Gemini par fragments (ou fallback regex multi-règles si `mock_llm=true` / pas de `GOOGLE_API_KEY`), et retourne **plusieurs** policies JSONB structurées (une par thème : repas, seuil d'approbation, marchands interdits, etc.) — jamais une seule policy avec le PDF entier dans `notes`. Query `mock_llm=true` pour le fallback sans API. Preview → `POST /api/policies/import/confirm` insère dans `policies`.
+Reçoit un PDF (base64) ou du texte brut. Le moteur [`api/policy_import.py`](api/policy_import.py) retourne **plusieurs** policies JSONB structurées (une par thème) — jamais une seule policy avec le PDF entier dans `notes`.
+
+**Extraction déterministe (offline-safe, toujours exécutée).** Segmentation en phrases, puis classification par *intention* (approbation / plafond / restriction) et catégorie Brim. Émet une policy ciblée par thème : seuils **numériques** (`approval_threshold_cad`, `category_limits_cad` par catégorie, `restricted_merchants`) **et** règles **qualitatives** sans montant (alcool, reçus, pourboires, usage carte corporative, intégrité des rapports, kilométrage) — capturées en `notes` sourcées du document. **N'invente jamais de montant** absent du document (l'ancien fallback fabriquait $500/$75/$250) ; si aucune règle, émet un résumé sourcé. Gère la prose réelle (le PDF Brim narratif donne 7 policies, dont le vrai seuil de **$50**), pas seulement les listes numérotées.
+
+**Avec Gemini** (`GOOGLE_API_KEY` présent et `mock_llm` non forcé) : extraction LLM par fragments **fusionnée** avec le déterministe — *gap-fill* par thème, donc on ne régresse jamais sous la base déterministe même si le LLM est conservateur. Le prompt LLM extrait aussi les règles qualitatives.
+
+> ⚠️ Le frontend force `mock_llm=true` par défaut ([`config.ts`](../brim-frontend/lib/api/config.ts) : `NEXT_PUBLIC_MOCK_LLM`). Pour activer Gemini, poser `NEXT_PUBLIC_MOCK_LLM=false` **et** `GOOGLE_API_KEY` côté backend ; sinon le déterministe (maintenant robuste) s'applique.
+
+Preview → `POST /api/policies/import/confirm` insère dans `policies`.
 
 ### `GET /api/policies` · `PATCH /api/policies/[id]` · `DELETE /api/policies/[id]`
 

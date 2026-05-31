@@ -28,10 +28,12 @@ GENERIC_POLICY_NAMES = frozenset({
 
 SECTION_HEADING_RE = re.compile(
     r"(?m)^(?:"
+    r"#{1,4}\s+\S[^\n]{0,80}|"                      # markdown headings
     r"§\s*\d+[\w.]*\s*[^\n]{0,80}|"
     r"section\s+\d+[\w.]*\s*[^\n]{0,80}|"
-    r"\d+(?:\.\d+){0,2}\s+[A-Z][^\n]{3,80}|"
-    r"[A-Z][A-Z0-9\s/&-]{4,60}$"
+    r"\d+[.)](?:\d+[.)]?)*\s+[A-Za-z][^\n]{2,80}|"  # 1. / 1) / 1.2 Title (digit-dot-space)
+    r"[A-Z][A-Za-z0-9 /&'-]{3,60}:[^\n]{0,8}|"      # 'Tips & Gratuities:' style sub-heading
+    r"[A-Z][A-Z0-9 /&-]{4,60}$"                     # ALL-CAPS heading line
     r")",
     re.I,
 )
@@ -93,18 +95,27 @@ Rules for policy_requirements (JSONB for a compliance engine):
 - restricted_merchants: blocked merchant substrings (e.g. bar, nightclub)
 - notes: ONE short sentence (max 200 characters). NEVER paste the full document.
 
-Each policy MUST include at least one structured field (not notes alone).
-NEVER return a single policy that dumps the entire document into notes.
+Extract EVERY distinct rule, even qualitative ones with no dollar amount.
+Many real policies are mostly prose: capture rules like alcohol restrictions,
+receipt requirements, tip/gratuity caps, no-personal-expenses-on-corporate-card,
+falsifying-reports-prohibited, mileage/travel rules. For a rule with no number,
+return a policy whose only field is a concise `notes` sentence describing it.
+NEVER return a single policy that dumps the entire document into notes — split it.
 
 Examples of correct output:
 1) policy_name: "Meal limits" — category_limits_cad: Repas Personnel 75, Repas Client 250,
    notes: "Solo vs client meal caps."
-2) policy_name: "Pre-approval threshold" — approval_threshold_cad: 500,
-   notes: "Purchases at or above $500 need approval."
+2) policy_name: "Pre-authorization threshold" — approval_threshold_cad: 50,
+   notes: "Expenses over $50 require manager pre-authorization; receipts required."
 3) policy_name: "Restricted merchants" — restricted_merchants: ["bar", "nightclub"],
    notes: "Alcohol-only venues blocked."
+4) policy_name: "Alcohol & entertainment" — notes: "Alcohol only reimbursable when
+   dining with a customer; guest names and purpose required."
+5) policy_name: "Tips & gratuities" — notes: "Tips up to 15% for services; meal tips
+   not reimbursed above 20%."
 
-Split by topic: meals, travel, software, approval thresholds, restricted merchants, etc."""
+Split by topic: approval thresholds, meals, travel, software, transport, fuel,
+restricted merchants, alcohol, receipts, tips, corporate-card use, report integrity, etc."""
 
 CHUNK_HUMAN = """Extract expense policy rules from THIS FRAGMENT ONLY (not the whole document).
 Return zero or more policies. Do not duplicate rules already obvious from other fragments.
@@ -289,111 +300,295 @@ def _merge_chunks(sections: list[tuple[str, str]]) -> list[str]:
     return chunks
 
 
-def _extract_requirements_from_section(section_text: str) -> dict[str, Any]:
-    """Regex extraction of structured fields from one section."""
-    req: dict[str, Any] = {}
-    threshold = re.search(
-        r"(?:pre[- ]?approval|approval|seuil|threshold)[^\d]{0,50}(\d{2,5})\s*(?:\$|CAD)?",
-        section_text,
-        re.I,
-    )
-    if threshold:
-        req["approval_threshold_cad"] = float(threshold.group(1))
+# --------------------------------------------------------------------------- #
+# Sentence-level, theme-aware deterministic extraction.
+#
+# Real expense policies are mostly prose, not numbered lists with dollar caps.
+# We segment the document into sentences, classify each by intent
+# (approval / limit / restriction) and Brim spend category, and emit one focused
+# policy per theme found — numeric (category caps, thresholds) AND qualitative
+# (alcohol, tips, receipts, corporate-card use, report integrity, mileage).
+# --------------------------------------------------------------------------- #
 
-    solo = re.search(
-        r"(?:solo|individual|personal|repas\s+personnel)[^\d]{0,40}(\d{2,3})\s*(?:\$|CAD)?",
-        section_text,
-        re.I,
-    )
-    team = re.search(
-        r"(?:team|client|repas\s+client)[^\d]{0,40}(\d{2,3})\s*(?:\$|CAD)?",
-        section_text,
-        re.I,
-    )
-    travel = re.search(
-        r"(?:trip|travel|voyage|conference)[^\d]{0,40}(\d{3,5})\s*(?:\$|CAD)?",
-        section_text,
-        re.I,
-    )
-    limits: dict[str, float] = {}
-    if solo:
-        limits["Repas Personnel"] = float(solo.group(1))
-    if team:
-        limits["Repas Client"] = float(team.group(1))
-    if travel:
-        limits["Voyage"] = float(travel.group(1))
-    if limits:
-        req["category_limits_cad"] = limits
+# $50 / $50.00 / 1,200 CAD / 250 dollars  (number-after form must be a real amount)
+_AMOUNT_RE = re.compile(
+    r"\$\s?([\d,]+(?:\.\d{1,2})?)"
+    r"|(?<![\d.])([\d,]{2,}(?:\.\d{1,2})?)\s*(?:\$|cad|dollars?)\b",
+    re.I,
+)
+_PERCENT_RE = re.compile(r"(\d{1,3})\s*%|\b(\d{1,3})\s*percent\b", re.I)
 
-    merchants: list[str] = []
-    for m in re.finditer(
-        r"(?:bar|nightclub|casino|liquor|adult)[^\n]{0,30}",
-        section_text,
-        re.I,
-    ):
-        word = m.group(0).split()[0].lower()
-        if word and word not in merchants:
-            merchants.append(word)
-    if merchants:
-        req["restricted_merchants"] = merchants[:10]
+# Keyword -> canonical Brim spend category (must match feature4 mapping).
+_CATEGORY_PATTERNS: list[tuple[str, str]] = [
+    ("Repas Personnel", r"\bsolo\b|dining alone|personal meal|individual meal|per[- ]?diem|employee meal"),
+    ("Repas Client", r"client meal|team meal|business meal|client (?:dinner|lunch)|team (?:dinner|lunch)|entertainment of (?:customers|clients)"),
+    ("Voyage", r"\btravel\b|flight|air ?fare|airline|hotel|lodging|accommodation|conference|per night|car rental"),
+    ("Logiciel / IT", r"software|subscription|saas|licen[cs]e|\blaptop\b|hardware|\bIT\b"),
+    ("Transport Local", r"taxi|ride[- ]?share|\buber\b|\blyft\b|transit|parking|ground transport|local transport|\btoll"),
+    ("Carburant", r"\bfuel\b|gas(?:oline)?|petrol|mileage|kilometre|kilometer"),
+]
 
-    summary = " ".join(section_text.split())
-    if summary:
-        req["notes"] = _truncate_notes(summary[:MAX_NOTES_LEN])
-    return req
+_APPROVAL_INTENT = re.compile(
+    r"pre-?auth|pre-?approv|must be approved|require[sd]?[^.]{0,25}(?:approv|authoriz|sign-?off)|need[^.]{0,15}approv",
+    re.I,
+)
+_LIMIT_INTENT = re.compile(
+    r"\bcap(?:ped)?\b|\blimit|up to|maximum|\bmax\b|not exceed|no more than|per night|per day|per person|allowance|reimburs(?:able|ed) up to",
+    re.I,
+)
+_RESTRICT_INTENT = re.compile(
+    r"prohibit|restrict|not permitted|not (?:be )?reimburs|forbidden|not allowed|never (?:be )?reimburs|\bbanned\b|expressly",
+    re.I,
+)
+# True restricted *venues* only — alcohol-the-beverage is contextual (handled as a note).
+_VENUE_RE = re.compile(
+    r"\b(bar|nightclub|strip club|casino|liquor store|liquor|cannabis|gambling|tobacco)s?\b",
+    re.I,
+)
+
+
+def _sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[.!?:])\s+|\n+", text)
+    return [p.strip() for p in parts if len(p.strip()) >= 3]
+
+
+def _amounts_in(sentence: str) -> list[float]:
+    out: list[float] = []
+    for m in _AMOUNT_RE.finditer(sentence):
+        raw = m.group(1) or m.group(2)
+        if not raw:
+            continue
+        try:
+            val = float(raw.replace(",", ""))
+        except ValueError:
+            continue
+        if 5 <= val <= 1_000_000:
+            out.append(val)
+    return out
+
+
+def _percents_in(sentence: str) -> list[int]:
+    out: list[int] = []
+    for m in _PERCENT_RE.finditer(sentence):
+        raw = m.group(1) or m.group(2)
+        try:
+            v = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= v <= 100:
+            out.append(v)
+    return out
+
+
+def _categories_in(sentence: str) -> list[str]:
+    cats: list[str] = []
+    for cat, pat in _CATEGORY_PATTERNS:
+        if re.search(pat, sentence, re.I) and cat not in cats:
+            cats.append(cat)
+    return cats
+
+
+def _clean_note(text: str, max_len: int = MAX_NOTES_LEN) -> str:
+    s = " ".join(text.split())
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1].rstrip() + "…"
+
+
+def _find_sentences(
+    sentences: list[str], pattern: str, limit: int = 1, prefer: str | None = None
+) -> list[str]:
+    rx = re.compile(pattern, re.I)
+    hits = [s for s in sentences if rx.search(s)]
+    if prefer:
+        pr = re.compile(prefer, re.I)
+        hits.sort(key=lambda s: 0 if pr.search(s) else 1)
+    return hits[:limit]
+
+
+def _analyze(text: str):
+    """One pass over the document: collect thresholds, category caps, restrictions."""
+    sentences = _sentences(text)
+    global_thresholds: list[float] = []
+    cat_limits: dict[str, float] = {}
+    cat_thresholds: dict[str, list[float]] = {}
+    restricted: list[str] = []
+
+    for sent in sentences:
+        if _RESTRICT_INTENT.search(sent):
+            for m in _VENUE_RE.finditer(sent):
+                word = m.group(1).lower()
+                if word not in restricted:
+                    restricted.append(word)
+        amounts = _amounts_in(sent)
+        if not amounts:
+            continue
+        cats = _categories_in(sent)
+        if _APPROVAL_INTENT.search(sent):
+            if cats:
+                for c in cats:
+                    cat_thresholds.setdefault(c, []).append(min(amounts))
+            else:
+                global_thresholds.extend(amounts)
+        elif _LIMIT_INTENT.search(sent) and cats:
+            amt = min(amounts)
+            for c in cats:
+                if c not in cat_limits or amt < cat_limits[c]:
+                    cat_limits[c] = amt
+
+    return sentences, global_thresholds, cat_limits, cat_thresholds, restricted
+
+
+def _category_policies(
+    cat_limits: dict[str, float], cat_thresholds: dict[str, list[float]]
+) -> list[dict[str, Any]]:
+    groups = [
+        ("Meal limits", ["Repas Personnel", "Repas Client"]),
+        ("Travel & lodging", ["Voyage"]),
+        ("Software & IT", ["Logiciel / IT"]),
+        ("Local transport", ["Transport Local"]),
+        ("Fuel", ["Carburant"]),
+    ]
+    policies: list[dict[str, Any]] = []
+    for name, cats in groups:
+        limits = {c: cat_limits[c] for c in cats if c in cat_limits}
+        thr_amounts = [a for c in cats for a in cat_thresholds.get(c, [])]
+        if not limits and not thr_amounts:
+            continue
+        req: dict[str, Any] = {}
+        bits: list[str] = []
+        if limits:
+            req["category_limits_cad"] = limits
+            bits.append("; ".join(f"{c} ${v:g}" for c, v in limits.items()))
+        if thr_amounts:
+            bits.append(f"approval required above ${min(thr_amounts):g}")
+        req["notes"] = _clean_note(f"{name}: {', '.join(bits)}." if bits else name)
+        policies.append(_policy_row(name, req))
+    return policies
+
+
+# (name, trigger pattern, preferred-sentence pattern, how many sentences to keep)
+_QUALITATIVE_THEMES: list[tuple[str, str, str | None, int]] = [
+    ("Receipts required", r"receipt", r"required|before|submit", 1),
+    ("Alcohol & entertainment", r"alcohol|alcoholic", r"unless|only|not permitted|customer|client", 1),
+    ("Tips & gratuities", r"\btips?\b|gratuit", r"%|percent", 2),
+    ("Corporate card use", r"corporate (?:credit )?cards?|personal expense", r"prohibit|personal expense|only the individual", 1),
+    ("Expense report integrity", r"falsif|abuse of this|expressly prohibited", r"falsif|prohibit", 1),
+    ("Vehicle, mileage & travel", r"mileage|kilometre|kilometer|canada revenue|cra rate|personal vehicle|car rental|traffic[^.]{0,12}ticket", r"reimburs|rate|not (?:pay|reimburs)", 1),
+]
+
+
+def _qualitative_policies(sentences: list[str]) -> list[dict[str, Any]]:
+    policies: list[dict[str, Any]] = []
+    for name, pat, prefer, limit in _QUALITATIVE_THEMES:
+        hits = _find_sentences(sentences, pat, limit=limit, prefer=prefer)
+        if not hits:
+            continue
+        note = _clean_note(" ".join(hits))
+        if len(note) < 10:
+            continue
+        policies.append(_policy_row(name, {"notes": note}))
+    return policies
 
 
 def _deterministic_extract(content: str) -> list[dict[str, Any]]:
-    """Multi-policy regex fallback when Gemini is unavailable."""
-    sections = split_policy_sections(content)
+    """Theme-aware extraction that works on prose policies, not just numbered caps.
+
+    Never invents amounts that are not in the document — if no rule is found it
+    emits a grounded summary, not fabricated defaults."""
+    sentences, global_thresholds, cat_limits, cat_thresholds, restricted = _analyze(content)
     policies: list[dict[str, Any]] = []
 
-    for title, body in sections:
-        req = _extract_requirements_from_section(body)
-        if not _has_structured_requirements(req):
+    if global_thresholds:
+        thr = min(global_thresholds)
+        note = _find_sentences(sentences, _APPROVAL_INTENT.pattern, limit=1, prefer=r"\$|\d")
+        note_text = _clean_note(note[0]) if note else f"Expenses at or above ${thr:g} require pre-approval."
+        policies.append(_policy_row(
+            "Pre-authorization threshold",
+            {"approval_threshold_cad": thr, "notes": note_text},
+        ))
+
+    policies.extend(_category_policies(cat_limits, cat_thresholds))
+
+    if restricted:
+        uniq: list[str] = []
+        for r in restricted:
+            if r not in uniq:
+                uniq.append(r)
+        policies.append(_policy_row(
+            "Restricted merchants",
+            {"restricted_merchants": uniq[:10], "notes": "Blocked venues: " + ", ".join(uniq[:10]) + "."},
+        ))
+
+    policies.extend(_qualitative_policies(sentences))
+
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for p in policies:
+        key = _normalize_name(p["policy_name"])
+        if key in seen:
             continue
-        name = title.strip()
-        if len(name) > 60 or (name.isupper() and len(name) > 20):
-            name = name.title()[:60]
-        policies.append(_policy_row(name, req))
+        seen.add(key)
+        deduped.append(p)
 
-    if policies:
-        _log(f"deterministic: {len(sections)} sections -> {len(policies)} policies")
-        return policies
+    if deduped:
+        _log(f"deterministic: {len(sentences)} sentences -> {len(deduped)} policies")
+        return deduped
 
-    global_req = _extract_requirements_from_section(content)
-    if global_req.get("approval_threshold_cad") is not None:
-        policies.append(_policy_row("Pre-approval threshold", {
-            "approval_threshold_cad": global_req["approval_threshold_cad"],
-            "notes": global_req.get("notes") or "Pre-approval threshold from policy document.",
-        }))
-    limits = global_req.get("category_limits_cad") or {}
-    if limits:
-        policies.append(_policy_row("Meal and category limits", {
-            "category_limits_cad": limits,
-            "notes": "Per-category spending limits.",
-        }))
-    if global_req.get("restricted_merchants"):
-        policies.append(_policy_row("Restricted merchants", {
-            "restricted_merchants": global_req["restricted_merchants"],
-            "notes": "Blocked merchant types.",
-        }))
+    summary = _clean_note(content)
+    if len(summary) >= 10:
+        _log("deterministic: no structured rules -> grounded summary policy")
+        return [_policy_row("Expense policy summary", {"notes": summary})]
+    return []
 
-    if not policies:
-        policies = [
-            _policy_row("Pre-approval threshold", {
-                "approval_threshold_cad": 500.0,
-                "notes": "Default threshold; refine after import.",
-            }),
-            _policy_row("Meal limits", {
-                "category_limits_cad": {"Repas Personnel": 75.0, "Repas Client": 250.0},
-                "notes": "Default meal caps; refine after import.",
-            }),
-        ]
-        _log("deterministic: no rules found, using defaults")
-    else:
-        _log(f"deterministic: document-wide -> {len(policies)} policies")
-    return policies
+
+def _policy_themes(policy: dict[str, Any]) -> set[str]:
+    """Coarse theme tags (structured fields + name/notes keywords) for gap-fill merge."""
+    req = policy.get("policy_requirements") or {}
+    tags: set[str] = set()
+    if req.get("approval_threshold_cad") is not None:
+        tags.add("threshold")
+    for c in (req.get("category_limits_cad") or {}):
+        cl = c.lower()
+        if "repas" in cl or "meal" in cl:
+            tags.add("meals")
+        elif "voyage" in cl or "travel" in cl:
+            tags.add("travel")
+        elif "logiciel" in cl or "software" in cl:
+            tags.add("software")
+        elif "transport" in cl:
+            tags.add("transport")
+        elif "carburant" in cl or "fuel" in cl:
+            tags.add("fuel")
+    if req.get("restricted_merchants"):
+        tags.add("restricted")
+    blob = (policy.get("policy_name", "") + " " + (req.get("notes") or "")).lower()
+    for kw, tag in [
+        ("alcohol", "alcohol"), ("tip", "tips"), ("gratuit", "tips"),
+        ("receipt", "receipts"), ("falsif", "integrity"), ("integrity", "integrity"),
+        ("corporate card", "card"), ("personal expense", "card"),
+        ("mileage", "vehicle"), ("kilomet", "vehicle"), ("vehicle", "vehicle"),
+        ("pre-auth", "threshold"), ("pre-approv", "threshold"),
+    ]:
+        if kw in blob:
+            tags.add(tag)
+    return tags
+
+
+def _merge_policies(
+    primary: list[dict[str, Any]], extra: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Keep `primary` (LLM) and gap-fill themes it missed from `extra` (deterministic)."""
+    covered: set[str] = set()
+    for p in primary:
+        covered |= _policy_themes(p)
+    out = list(primary)
+    for p in extra:
+        themes = _policy_themes(p)
+        if themes and not (themes & covered):
+            out.append(p)
+            covered |= themes
+    return out
 
 
 def _llm_extract_chunk(document: str) -> list[dict[str, Any]]:
@@ -484,32 +679,32 @@ def extract_policies_from_text(content: str, use_llm: bool = True) -> list[dict[
     if not text:
         return []
 
-    policies: list[dict[str, Any]] = []
+    # The deterministic engine is always run: it is the offline-safe baseline and,
+    # when the LLM is on, it gap-fills any theme the LLM missed (so we never regress).
+    deterministic = _deterministic_extract(text)
+    policies = deterministic
 
     if use_llm:
         import os
 
         if not os.getenv("GOOGLE_API_KEY"):
-            _log("llm skipped: GOOGLE_API_KEY not set -> deterministic")
-            policies = _deterministic_extract(text)
+            _log("llm skipped: GOOGLE_API_KEY not set -> deterministic only")
         else:
             try:
-                policies = _llm_extract(text)
-                if policies:
-                    _log(f"llm ok: {len(policies)} policies before validation")
+                llm = _llm_extract(text)
+                if llm:
+                    policies = _merge_policies(llm, deterministic)
+                    _log(f"llm ok: {len(llm)} llm + gap-fill -> {len(policies)} policies")
                 else:
-                    _log("llm returned empty -> deterministic fallback")
-                    policies = _deterministic_extract(text)
+                    _log("llm returned empty -> deterministic only")
             except Exception as exc:
-                _log(f"llm failed: {exc} -> deterministic fallback")
-                policies = _deterministic_extract(text)
+                _log(f"llm failed: {exc} -> deterministic only")
     else:
         _log("mock_llm=true -> deterministic")
-        policies = _deterministic_extract(text)
 
     validated = normalize_and_validate(policies)
-    if not validated and policies:
-        validated = normalize_and_validate(_deterministic_extract(text))
+    if not validated and deterministic:
+        validated = normalize_and_validate(deterministic)
     _log(f"final: {len(validated)} policies")
     return validated
 
