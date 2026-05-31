@@ -560,8 +560,30 @@ def mark_notification_read(client, notification_id: str) -> dict:
 MAP_CONNECT_DAYS = 7
 
 
+def _fill_coords_from_cache(client, df: pd.DataFrame) -> pd.DataFrame:
+    """Fill missing lat/lng from the city_geocodes cache. No network calls."""
+    if "city" not in df.columns:
+        return df
+    missing = df["latitude"].isna() | df["longitude"].isna()
+    if not missing.any():
+        return df
+    from api.geocoding import load_geocode_cache, normalize_city
+
+    cache = load_geocode_cache(client)
+    if not cache:
+        return df
+    keys = df.loc[missing, "city"].map(normalize_city)
+    df.loc[missing, "latitude"] = keys.map(lambda k: cache.get(k, (None, None))[0])
+    df.loc[missing, "longitude"] = keys.map(lambda k: cache.get(k, (None, None))[1])
+    return df
+
+
 def _geolocated_transactions(client) -> pd.DataFrame:
-    """Transactions with valid latitude/longitude and a parseable date."""
+    """Transactions with valid latitude/longitude and a parseable date.
+
+    Rows lacking lat/lng but whose city is in the geocode cache are filled in
+    from the cache before the dropna (cache is populated by geocode_transactions.py).
+    """
     df = fetch_table(client, "transactions")
     if df.empty:
         return pd.DataFrame()
@@ -569,6 +591,9 @@ def _geolocated_transactions(client) -> pd.DataFrame:
         if col not in df.columns:
             return pd.DataFrame()
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = _fill_coords_from_cache(client, df)
+    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
     df = df.dropna(subset=["latitude", "longitude"])
     if df.empty:
         return pd.DataFrame()

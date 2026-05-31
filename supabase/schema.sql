@@ -65,6 +65,15 @@ CREATE TABLE employee_strikes (
     amount_cheated     NUMERIC(12, 2) NOT NULL DEFAULT 0
 );
 
+-- City -> coordinates cache for the purchase map (filled by geocode_transactions.py).
+-- city is the normalized (UPPER/trim) key; resolved=false means geocoding failed/invalid.
+CREATE TABLE city_geocodes (
+    city      TEXT PRIMARY KEY,
+    latitude  DOUBLE PRECISION,
+    longitude DOUBLE PRECISION,
+    resolved  BOOLEAN NOT NULL DEFAULT FALSE
+);
+
 -- transaction_flags.reviewed: if PATCH /api/flags/{id}/reviewed fails (PGRST204), run
 -- supabase/migrations/20260531_transaction_flags_reviewed.sql on the remote project.
 CREATE TABLE transaction_flags (
