@@ -134,14 +134,23 @@ def load_all_from_supabase(client):
 
 def load_policy_from_dataframe(policies_df: pd.DataFrame) -> dict[str, Any]:
     """Merge active Supabase policies into the policy dict Feature 2 expects."""
+    # No policies at all → fall back to the built-in DEFAULT_POLICY (caps included).
+    if policies_df.empty:
+        return {
+            **DEFAULT_POLICY,
+            "category_limits_cad": dict(DEFAULT_POLICY["category_limits_cad"]),
+            "restricted_categories": list(DEFAULT_POLICY["restricted_categories"]),
+            "restricted_merchants": list(DEFAULT_POLICY["restricted_merchants"]),
+        }
+    # With active policies present, derive limits/restrictions ONLY from them — never
+    # inject DEFAULT_POLICY's hardcoded meal caps (e.g. $75/$250) that the imported
+    # source document never stated. Keeps enforcement faithful to the actual policy.
     policy: dict[str, Any] = {
         **DEFAULT_POLICY,
-        "category_limits_cad": dict(DEFAULT_POLICY["category_limits_cad"]),
-        "restricted_categories": list(DEFAULT_POLICY["restricted_categories"]),
-        "restricted_merchants": list(DEFAULT_POLICY["restricted_merchants"]),
+        "category_limits_cad": {},
+        "restricted_categories": [],
+        "restricted_merchants": [],
     }
-    if policies_df.empty:
-        return policy
 
     names: list[str] = []
     notes: list[str] = []
