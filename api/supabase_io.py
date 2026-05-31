@@ -280,12 +280,24 @@ def apply_decision_to_supabase(client, result: dict) -> None:
 
 
 def persist_reports_output(client, assignments: list[dict], reports: list[dict]) -> dict:
-    updated_groups = 0
+    # Persist all transaction -> event_group_id assignments in a SINGLE round-trip via
+    # the apply_event_groups() RPC. The old code did one UPDATE per transaction, which
+    # meant thousands of sequential HTTP calls and a 60s gateway timeout on batch runs.
+    by_group: dict[str, list[str]] = {}
     for item in assignments:
-        client.table("transactions").update(
-            {"event_group_id": item["event_group_id"]}
-        ).eq("id", item["transaction_id"]).execute()
-        updated_groups += 1
+        by_group.setdefault(item["event_group_id"], []).append(str(item["transaction_id"]))
+
+    updated_groups = 0
+    if assignments:
+        try:
+            client.rpc("apply_event_groups", {"assignments": assignments}).execute()
+            updated_groups = len(assignments)
+        except Exception:  # noqa: BLE001 — RPC not installed yet: fall back to grouped updates
+            for group_id, tids in by_group.items():
+                client.table("transactions").update(
+                    {"event_group_id": group_id}
+                ).in_("id", tids).execute()
+            updated_groups = len(assignments)
 
     inserted_reports = 0
     clean_reports = [{k: v for k, v in r.items() if not k.startswith("_")} for r in reports]
@@ -293,7 +305,11 @@ def persist_reports_output(client, assignments: list[dict], reports: list[dict])
         client.table("expense_reports").upsert(clean_reports, on_conflict="id").execute()
         inserted_reports = len(clean_reports)
 
-    return {"event_groups_updated": updated_groups, "reports_upserted": inserted_reports}
+    return {
+        "event_groups_updated": updated_groups,
+        "event_group_count": len(by_group),
+        "reports_upserted": inserted_reports,
+    }
 
 
 def employee_name_map(client) -> dict[str, str]:

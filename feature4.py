@@ -67,7 +67,7 @@ except ImportError:
 # Config
 # =========================================================================== #
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
 DEFAULT_BRIM_CATEGORY = "Autre"
 GROUP_GAP_DAYS = 4            # a date gap larger than this starts a new event (different place)
 SAME_PLACE_GAP_BONUS = 3     # same-location clusters tolerate this many EXTRA gap days (weekends mid-trip)
@@ -75,6 +75,7 @@ GEO_SAME_KM = 50.0           # transactions within this distance count as the sa
 LABEL_BATCH_SIZE = 40        # clusters per labeling LLM call
 RECO_BATCH_SIZE = 40         # reports per recommendation LLM call
 AUTO_APPROVE_MAX_CAD = 100.0 # trivial reports below this (1 item, no flags) auto-approve
+SINGLE_REPORT_MIN_CAD = 500.0 # a lone transaction this large still merits its own report
 
 
 def get_model() -> str:
@@ -457,6 +458,21 @@ def recommend(reports: list[dict], use_llm: bool) -> None:
 # Build expense_reports + event_group_id assignments
 # =========================================================================== #
 
+# Stable namespace so event_group_id / report id are deterministic across runs:
+# the same set of transactions always yields the same ids, making the Supabase
+# upsert idempotent (re-running a batch overwrites instead of duplicating).
+_F4_NS = uuid.UUID("b1115204-0000-4000-8000-000000000004")
+
+
+def _group_id_for(transaction_ids: list[str]) -> str:
+    key = "|".join(sorted(str(t) for t in transaction_ids))
+    return uuid.uuid5(_F4_NS, key).hex
+
+
+def _report_id_for(group_id: str) -> str:
+    return uuid.uuid5(_F4_NS, "report:" + group_id).hex
+
+
 def build_reports(df: pd.DataFrame, gap_days: int, flags: dict, strikes: dict,
                   use_llm: bool) -> tuple[list[dict], list[dict]]:
     clusters = cluster_transactions(df, gap_days)
@@ -467,17 +483,28 @@ def build_reports(df: pd.DataFrame, gap_days: int, flags: dict, strikes: dict,
     reports: list[dict] = []
     li = iter(labels)
     for c in clusters:
-        group_id = uuid.uuid4().hex
-        for tid in c["id"]:
-            assignments.append({"transaction_id": str(tid), "event_group_id": group_id})
+        is_multi = len(c) > 1
+        tids = [str(t) for t in c["id"]]
+        if not is_multi:
+            # A single small, unflagged charge is not an "event" worth its own report —
+            # generating one per isolated transaction is what produced thousands of noise
+            # reports. Keep only material singles (large amount or already flagged).
+            row = c.iloc[0]
+            material = float(row["amount"]) >= SINGLE_REPORT_MIN_CAD or bool(flags.get(tids[0]))
+            if not material:
+                continue
 
-        if len(c) > 1:
+        group_id = _group_id_for(tids)
+        for tid in tids:
+            assignments.append({"transaction_id": tid, "event_group_id": group_id})
+
+        if is_multi:
             lab = next(li)
             title, reasoning = lab["title"], lab["reasoning"]
         else:
             row = c.iloc[0]
             title = f"{row['merchant_name']} ({row['brim_category']})"
-            reasoning = "Transaction isolée."
+            reasoning = "Transaction isolée notable (montant élevé ou signalée)."
 
         dates = [d for d in c["date"].map(_parse_date) if d]
         emp_ids = [str(x) for x in c["employee_id"].dropna().unique()]
@@ -492,7 +519,7 @@ def build_reports(df: pd.DataFrame, gap_days: int, flags: dict, strikes: dict,
 
         reports.append({
             # ---- columns that map straight to the expense_reports table ----
-            "id": uuid.uuid4().hex,
+            "id": _report_id_for(group_id),
             "employee_id": emp_ids[0] if emp_ids else None,
             "event_group_id": group_id,
             "title": title,
@@ -535,7 +562,7 @@ def main() -> int:
     ap.add_argument("--strikes", default=None, help="employee_strikes CSV (optional).")
     ap.add_argument("--employees", default=None)
     ap.add_argument("--departments", default=None)
-    ap.add_argument("--model", default=None, help="Gemini model id (default gemini-2.5-flash).")
+    ap.add_argument("--model", default=None, help="Gemini model id (default gemini-3.1-flash-lite).")
     ap.add_argument("--gap-days", type=int, default=GROUP_GAP_DAYS)
     ap.add_argument("--limit", type=int, default=None, help="Only process the first N transactions.")
     ap.add_argument("--mock-llm", action="store_true", help="No API calls.")

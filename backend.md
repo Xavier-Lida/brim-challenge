@@ -85,7 +85,9 @@ Servi par le **moteur Feature 3** (`feature3.py`, voir plus bas). GET retourne l
 Deux modes, tous deux servis par le **moteur Feature 4** (`feature4.py`, voir plus bas) :
 
 - **Single** — reçoit un `event_group_id`. Récupère toutes les transactions du groupe depuis Supabase, jointes avec les données employé et les flags éventuels. Gemini génère un résumé narratif du voyage/événement, vérifie la conformité aux policies actives, identifie les anomalies, et produit une **recommandation d'approbation** (`approve` / `review` / `deny`). Le rapport est mis en forme en PDF, uploadé dans Supabase Storage, et une entrée est créée dans `expense_reports` (avec `pdf_url`, `ai_recommendation`, `ai_reasoning`, `status = ready_for_approval`).
-- **Batch** — sans `event_group_id`, le moteur regroupe lui-même les transactions récentes non assignées en événements, met à jour `transactions.event_group_id`, et crée un `expense_reports` par événement. C'est le scénario « Sarah à San Diego » : 10 transactions proches → un rapport, lié aux spend categories, prêt pour le CFO avec sa recommandation de politique.
+- **Batch** — sans `event_group_id`, le moteur regroupe les transactions non assignées en événements, met à jour `transactions.event_group_id`, et crée un `expense_reports` **par événement réel**. C'est le scénario « Sarah à San Diego » : 10 transactions proches → un rapport, lié aux spend categories, prêt pour le CFO avec sa recommandation de politique.
+
+  **Idempotence & perf** (corrige le timeout 60s + les rapports en double) : `event_group_id` et l'`id` du rapport sont **déterministes** (`uuid5` de la composition du cluster), donc un rerun *upsert* au lieu de dupliquer. Seuls les **événements réels** génèrent un rapport — clusters multi-transactions **plus** transactions isolées *matérielles* (`montant ≥ SINGLE_REPORT_MIN_CAD = 500` ou déjà signalée) ; les petites charges isolées ne créent plus de bruit. Les assignations sont persistées en **un seul appel** via la RPC `apply_event_groups` ([`supabase/migrations/20260531_apply_event_groups.sql`](supabase/migrations/20260531_apply_event_groups.sql)) — fallback en updates groupés (`.in_`) si la RPC n'est pas encore installée.
 
 ### `POST /api/webhooks/supabase`
 
@@ -186,7 +188,7 @@ py feature3.py --decide tx-001 --decision approve --approver-id cfo-1
 
 ## Feature 4 — Moteur de génération de rapports (`feature4.py`)
 
-Pipeline batch autonome (pandas + LangChain · Gemini, défaut `gemini-2.5-flash` configurable via `GEMINI_MODEL` / `--model`) qui transforme des `transactions` en `expense_reports` prêts à approuver. Il parle directement le schéma Supabase via des CSV en entrée (`transactions` + `mcc_codes` requis ; `transaction_flags`, `employee_strikes`, `employees`, `departments` optionnels) et émet du JSON réinjectable :
+Pipeline batch autonome (pandas + LangChain · Gemini, défaut `gemini-3.1-flash-lite` configurable via `GEMINI_MODEL` / `--model`) qui transforme des `transactions` en `expense_reports` prêts à approuver. Il parle directement le schéma Supabase via des CSV en entrée (`transactions` + `mcc_codes` requis ; `transaction_flags`, `employee_strikes`, `employees`, `departments` optionnels) et émet du JSON réinjectable :
 
 ```
 {
@@ -243,6 +245,7 @@ Si une route échoue alors que le code est à jour, appliquer les migrations dan
 | -------- | --------- |
 | `PATCH /api/flags/{id}/reviewed` → 500 / PGRST204 `reviewed` | [`20260531_transaction_flags_reviewed.sql`](supabase/migrations/20260531_transaction_flags_reviewed.sql) |
 | `PATCH /api/approvals/{id}` → `notifications_type_check` / `decision` | [`20260531_notifications_decision_type.sql`](supabase/migrations/20260531_notifications_decision_type.sql) |
+| `POST /api/reports/generate` (batch) → **504** / lent / rapports en double | [`20260531_apply_event_groups.sql`](supabase/migrations/20260531_apply_event_groups.sql) (RPC d'assignation en masse) |
 
 Après exécution, attendre quelques secondes pour le cache PostgREST.
 
