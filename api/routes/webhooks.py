@@ -12,6 +12,7 @@ from api.deps import supabase_client
 from api.routes.approvals import _policy_threshold
 from api.supabase_io import (
     flags_dict_from_db,
+    load_active_policies_list,
     load_active_policy,
     load_all_from_supabase,
     load_transactions_frame,
@@ -95,8 +96,10 @@ def handle_supabase_webhook(
         row_mask = df_all["id"].astype(str) == transaction_id
         approval_df = df_all[row_mask]
         if not approval_df.empty:
+            active_policies = load_active_policies_list(client)
             approval_requests, notifications, _emails = build_pipeline(
-                approval_df, flags, strikes, budgets, threshold, approver_to, use_llm=False
+                approval_df, flags, strikes, budgets, threshold, approver_to, use_llm=False,
+                active_policies=active_policies,
             )
             persist_pipeline_to_supabase(client, approval_requests, notifications)
             results["steps"].append({

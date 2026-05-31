@@ -150,6 +150,7 @@ def _normalize_quarter(value: Any) -> str | None:
 from api.supabase_io import (
     apply_decision_to_supabase,
     get_supabase_client,
+    load_active_policies_list,
     load_all_from_supabase,
     persist_pipeline_to_supabase,
 )
@@ -224,10 +225,15 @@ def needs_approval(row: pd.Series, tx_flags: list[dict], threshold: float) -> bo
 
 
 def _reason_for(row: pd.Series, tx_flags: list[dict], threshold: float) -> str:
-    msgs = [f["warning_message"] for f in tx_flags if f.get("warning_message")]
-    if msgs:
-        return " | ".join(msgs[:3])
-    return f"Montant {_cad(float(row['amount']))} dépasse le seuil d'approbation de {_cad(threshold)}."
+    from api.approval_messages import format_approval_reason_from_flags
+
+    merchant = (
+        str(row.get("merchant_name"))
+        if pd.notna(row.get("merchant_name")) else None
+    )
+    return format_approval_reason_from_flags(
+        tx_flags, float(row["amount"]), threshold, merchant,
+    )
 
 
 # =========================================================================== #
@@ -235,16 +241,21 @@ def _reason_for(row: pd.Series, tx_flags: list[dict], threshold: float) -> str:
 # =========================================================================== #
 
 RECO_SYSTEM = """You are an AI expense-approval assistant for a corporate finance team.
+Always respond in English only.
 For each request you receive the employee, department, amount (CAD), the reason it needs
 approval, the department's budget status for the quarter, the employee's spend history,
-any compliance warnings (each with a severity weight 1-5), and the employee's strike history.
+any compliance warnings (each with a severity weight 1-5), the employee's strike history,
+and per-policy pass/fail checks.
 Recommend exactly one of: "approve", "review", or "deny" for the approver.
 - approve: within policy and budget, consistent with the employee's past pattern.
 - review: needs a human look (over/near budget, large amount, low-weight warnings, thin context).
 - deny: clear violation (high-weight warning, or a repeat offender with prior strikes,
         or clearly over the remaining budget without justification).
+When SEVERAL policy_checks have status "failed", your reasoning MUST name every failed
+policy (not just the first), and lean stronger (review->deny) the more rules are breached.
+The same goes for multiple compliance warnings: weigh them together, not one at a time.
 Reference the actual numbers: amount vs remaining budget, prior similar expenses, warnings,
-strikes. Be concise (1-2 sentences), like:
+strikes, and failed policy checks. Be concise (1-2 sentences), like:
 "Sarah is requesting $1,200; Marketing has $3,400 left in Q2 and she has 2 similar expenses
 this year. Approve - within policy, aligns with past pattern." """
 
@@ -270,32 +281,9 @@ def _reco_schema():
 
 
 def _deterministic_reco(ctx: dict, threshold: float) -> tuple[str, str]:
-    flags = ctx["warnings"]
-    strikes = ctx["strike_history"]
-    budget = ctx["budget"]
-    amount = ctx["amount_cad"]
-    max_w = max((f["weight"] for f in flags), default=0.0)
-    n_strikes = strikes["count"] if strikes else 0
-    over_budget = bool(budget) and amount > budget["remaining"]
+    from api.approval_messages import format_deterministic_reco
 
-    budget_txt = (f"{ctx['department']} a {_cad(budget['remaining'])} restant en "
-                  f"{budget['quarter']} {budget['year']}" if budget else "budget non disponible")
-    base = (f"{ctx['employee']} demande {_cad(amount)}; {budget_txt}; "
-            f"{ctx['spend_history']['similar_prior_count']} dépense(s) similaire(s) cette année")
-
-    if max_w >= DENY_WEIGHT or n_strikes >= 2:
-        return "deny", (f"{base}. Refus — avertissement de conformité élevé "
-                        f"(poids max {max_w:g}) ou {n_strikes} antécédent(s).")
-    if over_budget:
-        return "review", (f"{base}. À revoir — la demande dépasse le budget restant.")
-    if flags:
-        return "review", (f"{base}. À revoir — {len(flags)} avertissement(s) de conformité "
-                          f"(poids max {max_w:g}).")
-    if amount > threshold:
-        return "review", (f"{base}. À revoir — montant au-dessus du seuil "
-                          f"de {_cad(threshold)}, aucun avertissement.")
-    return "approve", (f"{base}. Approbation — dans la politique et le budget, "
-                       f"cohérent avec l'historique.")
+    return format_deterministic_reco(ctx, threshold, deny_weight=DENY_WEIGHT)
 
 
 def recommend(requests: list[dict], threshold: float, use_llm: bool) -> None:
@@ -321,6 +309,7 @@ def recommend(requests: list[dict], threshold: float, use_llm: bool) -> None:
                     "spend_history": r["_ctx"]["spend_history"],
                     "warnings": r["_ctx"]["warnings"],
                     "strike_history": r["_ctx"]["strike_history"],
+                    "policy_checks": r.get("policy_checks") or [],
                 } for r in batch]
                 res = chain.invoke({"requests_json": json.dumps(slim, ensure_ascii=False),
                                     "n": len(batch)})
@@ -445,8 +434,12 @@ def send_email_resend(payload: dict, from_addr: str) -> bool:
 
 def build_pipeline(df: pd.DataFrame, flags: dict, strikes: dict, budgets: dict,
                    threshold: float, approver_to: str, use_llm: bool,
+                   active_policies: list[dict] | None = None,
                    ) -> tuple[list[dict], list[dict], list[dict]]:
+    from api.policy_checks import evaluate_policy_checks
+
     dept_spend = department_spend(df)
+    policies = active_policies or []
 
     notifications: list[dict] = []
     seen_flag_tx: set[str] = set()
@@ -493,6 +486,7 @@ def build_pipeline(df: pd.DataFrame, flags: dict, strikes: dict, budgets: dict,
             "reason": _reason_for(row, tx_flags, threshold),
             "ai_recommendation": None,   # filled by recommend()
             "ai_reasoning": None,
+            "policy_checks": evaluate_policy_checks(row, policies, budget=ctx["budget"]),
             "status": "pending",
             "approver_id": None,
             "decided_at": None,
@@ -629,6 +623,7 @@ def main() -> int:
 
     client = get_supabase_client()
     df, flags, strikes, budgets = load_all_from_supabase(client)
+    active_policies = load_active_policies_list(client)
     use_llm = not args.mock_llm
 
     # ---- Decision mode -------------------------------------------------------
@@ -654,12 +649,14 @@ def main() -> int:
     # ---- Pipeline mode -------------------------------------------------------
     try:
         approval_requests, notifications, emails = build_pipeline(
-            df, flags, strikes, budgets, args.threshold, args.approver_to, use_llm)
+            df, flags, strikes, budgets, args.threshold, args.approver_to, use_llm,
+            active_policies=active_policies)
         mode = get_model() if use_llm else "mock"
     except Exception as exc:  # noqa: BLE001 — never hard-fail; degrade to deterministic
         print(f"[pipeline LLM unavailable: {exc}] -> deterministic fallback", file=sys.stderr)
         approval_requests, notifications, emails = build_pipeline(
-            df, flags, strikes, budgets, args.threshold, args.approver_to, use_llm=False)
+            df, flags, strikes, budgets, args.threshold, args.approver_to, use_llm=False,
+            active_policies=active_policies)
         mode = "mock (fallback)"
 
     if args.send:

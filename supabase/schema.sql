@@ -93,6 +93,7 @@ CREATE TABLE approval_requests (
     reason            TEXT,
     ai_recommendation TEXT CHECK (ai_recommendation IN ('approve', 'review', 'deny')),
     ai_reasoning      TEXT,
+    policy_checks     JSONB NOT NULL DEFAULT '[]'::jsonb,
     status            TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'approved', 'denied')),
     approver_id       TEXT,
