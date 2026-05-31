@@ -813,6 +813,139 @@ def list_approvals_enriched(client) -> list[dict]:
     return out
 
 
+def _report_pdf_url(report_id: str) -> str:
+    return f"/api/reports/{report_id}/pdf"
+
+
+def _employee_attribution(client) -> dict[str, dict[str, str | None]]:
+    """employee_id -> {name, department} from employees + departments."""
+    emp_df = fetch_table(client, "employees")
+    dept_df = fetch_table(client, "departments")
+    emp_merge = prepare_employees_for_merge(
+        emp_df if not emp_df.empty else None,
+        dept_df if not dept_df.empty else None,
+    )
+    out: dict[str, dict[str, str | None]] = {}
+    if emp_merge is None or emp_merge.empty:
+        return out
+    for _, r in emp_merge.iterrows():
+        emp_id = str(r["employee_id"])
+        name = str(r.get("employee_name") or "").strip() or None
+        dept = r.get("department")
+        out[emp_id] = {
+            "name": name,
+            "department": str(dept) if pd.notna(dept) and str(dept).strip() else None,
+        }
+    return out
+
+
+def _transactions_by_event_group(
+    client, event_group_ids: list[str]
+) -> dict[str, list[dict]]:
+    """Chronological line items per event_group_id, Brim-categorized, purchases only."""
+    if not event_group_ids:
+        return {}
+    rows: list[dict] = []
+    for chunk in _chunked(event_group_ids):
+        res = (
+            client.table("transactions")
+            .select("*")
+            .in_("event_group_id", chunk)
+            .execute()
+        )
+        rows.extend(res.data or [])
+    if not rows:
+        return {}
+
+    tx_df = pd.DataFrame(rows)
+    tx_df = _drop_non_purchase_rows(tx_df)
+    if tx_df.empty:
+        return {}
+    cat_map = get_mcc_category_map(client)
+    tx_df = apply_brim_categories(tx_df, cat_map)
+
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for _, r in tx_df.iterrows():
+        group_id = str(r.get("event_group_id") or "")
+        if not group_id:
+            continue
+        grouped[group_id].append({
+            "date": str(r.get("date", ""))[:10],
+            "merchant_name": str(r.get("merchant_name") or ""),
+            "merchant_category": str(r.get("brim_category") or DEFAULT_BRIM_CATEGORY),
+            "city": str(r.get("city") or ""),
+            "amount": round(float(r.get("amount") or 0), 2),
+        })
+    for group_id in grouped:
+        grouped[group_id].sort(key=lambda t: t["date"])
+    return dict(grouped)
+
+
+def _enrich_reports(client, rows: list[dict]) -> list[dict]:
+    """Attach currency, employee/department names, and transaction line items."""
+    if not rows:
+        return []
+    attribution = _employee_attribution(client)
+    group_ids = sorted(
+        {str(r["event_group_id"]) for r in rows if r.get("event_group_id")}
+    )
+    tx_by_group = _transactions_by_event_group(client, group_ids)
+
+    items: list[dict] = []
+    for r in rows:
+        report = dict(r)
+        report_id = str(report.get("id", ""))
+        emp_id = str(report.get("employee_id") or "")
+        attr = attribution.get(emp_id, {})
+        group_id = str(report.get("event_group_id") or "")
+        transactions = tx_by_group.get(group_id, [])
+
+        report["currency"] = report.get("currency") or "CAD"
+        report["employee_name"] = attr.get("name")
+        report["department_name"] = attr.get("department")
+        report["transactions"] = transactions
+        report["transaction_count"] = len(transactions)
+        if not report.get("pdf_url"):
+            report["pdf_url"] = _report_pdf_url(report_id)
+        items.append(report)
+    return items
+
+
+def list_expense_reports_page(client, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    res = (
+        client.table("expense_reports")
+        .select("*", count="exact")
+        .order("created_at", desc=True)
+        .order("id")
+        .range(offset, offset + limit - 1)
+        .execute()
+    )
+    rows = res.data or []
+    items = _enrich_reports(client, rows)
+    total = res.count if res.count is not None else offset + len(items)
+    return {
+        "items": items,
+        "has_more": offset + len(items) < total,
+        "limit": limit,
+        "offset": offset,
+        "total_count": total,
+    }
+
+
+def get_expense_report_detail(client, report_id: str) -> dict | None:
+    res = (
+        client.table("expense_reports")
+        .select("*")
+        .eq("id", report_id)
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    if not rows:
+        return None
+    return _enrich_reports(client, rows)[0]
+
+
 def list_expense_reports(client) -> list[dict]:
     df = fetch_table(client, "expense_reports")
     if df.empty:
