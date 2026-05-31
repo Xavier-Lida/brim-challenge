@@ -364,3 +364,58 @@ def list_expense_reports(client) -> list[dict]:
     if df.empty:
         return []
     return df.to_dict(orient="records")
+
+
+def list_policies(client) -> list[dict]:
+    df = fetch_table(client, "policies")
+    if df.empty:
+        return []
+    records = df.to_dict(orient="records")
+    records.sort(key=lambda r: str(r.get("effective_date", "")), reverse=True)
+    return records
+
+
+def upsert_policy(client, row: dict) -> dict:
+    res = client.table("policies").upsert(row, on_conflict="id").execute()
+    if not res.data:
+        raise RuntimeError("Failed to upsert policy")
+    return res.data[0]
+
+
+def insert_policies(client, rows: list[dict]) -> list[dict]:
+    if not rows:
+        return []
+    res = client.table("policies").upsert(rows, on_conflict="id").execute()
+    return res.data or rows
+
+
+def deactivate_policy(client, policy_id: str) -> dict:
+    res = (
+        client.table("policies")
+        .update({"active": False})
+        .eq("id", policy_id)
+        .execute()
+    )
+    if not res.data:
+        raise KeyError(f"Policy {policy_id} not found")
+    return res.data[0]
+
+
+def list_notifications(client, unread_only: bool = False) -> list[dict]:
+    query = client.table("notifications").select("*")
+    if unread_only:
+        query = query.eq("read", False)
+    res = query.order("created_at", desc=True).execute()
+    return res.data or []
+
+
+def mark_notification_read(client, notification_id: str) -> dict:
+    res = (
+        client.table("notifications")
+        .update({"read": True})
+        .eq("id", notification_id)
+        .execute()
+    )
+    if not res.data:
+        raise KeyError(f"Notification {notification_id} not found")
+    return res.data[0]

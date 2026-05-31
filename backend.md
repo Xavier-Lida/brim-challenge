@@ -2,7 +2,24 @@
 
 ## Stack
 
-Next.js 14 API Routes, Supabase (DB + Auth + Realtime), Google Gemini API, Resend (emails). Moteurs Python (features 1/2/4) : pandas + LangChain (`langchain-google-genai`) + pydantic, plus DuckDB pour le text-to-SQL de Feature 1 (voir `feature1.py`, `feature2.py`, `feature4.py`).
+**FastAPI** (Python) + **Uvicorn**, Supabase (Postgres), Google Gemini API (`langchain-google-genai`), Resend (emails). Frontend : **Next.js** (`brim-frontend`) consomme l'API REST sur `NEXT_PUBLIC_API_URL` (défaut `http://127.0.0.1:8000`). Moteurs Python (features 1–4) : pandas + LangChain + pydantic, plus DuckDB pour le text-to-SQL de Feature 1 (voir `feature1.py`, `feature2.py`, `feature3.py`, `feature4.py`).
+
+**Lancer le backend :** `uvicorn main:app --reload --port 8000` (variables dans `.env.example`).
+
+**Routes implémentées (FastAPI) :**
+
+| Route | Statut |
+| ----- | ------ |
+| `GET /health` | OK |
+| `GET /api/transactions` | OK |
+| `GET /api/flags`, `PATCH /api/flags/{id}/reviewed` | OK |
+| `GET /api/approvals`, `POST /api/approvals/run`, `PATCH /api/approvals/{id}` | OK |
+| `GET /api/reports`, `POST /api/reports/generate` | OK |
+| `POST /api/compliance/scan` | OK |
+| `POST /api/assistant` | OK |
+| `GET/POST/PATCH/DELETE /api/policies`, `POST /api/policies/import`, `POST /api/policies/import/confirm` | OK |
+| `GET /api/notifications`, `PATCH /api/notifications/{id}/read` | OK |
+| `POST /api/webhooks/supabase` | OK (trigger SQL dans `supabase/triggers.sql`) |
 
 ---
 
@@ -20,9 +37,9 @@ Next.js 14 API Routes, Supabase (DB + Auth + Realtime), Google Gemini API, Resen
 | `transactions`      | id, employee_id, date, amount, merchant_name, merchant_category, city, zipcode, latitude, longitude, event_group_id, status |
 | `approval_requests` | id, transaction_id, employee_id, amount, reason, ai_recommendation, ai_reasoning, status, approver_id, decided_at  |
 | `expense_reports`   | id, employee_id, event_group_id, title, date_from, date_to, total_amount, status, pdf_url, ai_recommendation, ai_reasoning |
-| `notifications`     | id, type **('flag' \| 'approval')**, reference_id, message, read, created_at                                        |
+| `notifications`     | id, type **('flag' \| 'approval' \| 'decision')**, reference_id, message, read, created_at                                        |
 
-> Schéma canonique : [`supabase/schema.sql`](supabase/schema.sql) (DDL). Notes clés : `transaction_flags.weight` est un **entier 1–5** (contrainte CHECK) — l'échelle de sévérité partagée par tout le pipeline ; `policies.policy_requirements` est du **JSONB** (règles structurées) ; `notifications.type` ∈ {`flag`, `approval`}. La table `budgets` (budget trimestriel par département) alimente le statut budgétaire de Feature 3.
+> Schéma canonique : [`supabase/schema.sql`](supabase/schema.sql) (DDL). Notes clés : `transaction_flags.weight` est un **entier 1–5** (contrainte CHECK) — l'échelle de sévérité partagée par tout le pipeline ; `policies.policy_requirements` est du **JSONB** structuré (`approval_threshold_cad`, `category_limits_cad`, `restricted_categories`, `restricted_merchants`, `notes`) — source de vérité pour Features 2 et 3 ; `notifications.type` ∈ {`flag`, `approval`, `decision`}. La table `budgets` (budget trimestriel par département) alimente le statut budgétaire de Feature 3.
 
 
 ---

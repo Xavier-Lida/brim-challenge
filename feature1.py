@@ -151,6 +151,68 @@ def build_db(args) -> tuple[duckdb.DuckDBPyConnection, set[str]]:
     return con, present
 
 
+def build_db_from_supabase(client, limit: int | None = None) -> tuple[duckdb.DuckDBPyConnection, set[str]]:
+    """Load Supabase tables into an in-memory DuckDB (same shape as build_db)."""
+    from api.supabase_io import fetch_table, load_transactions_frame
+
+    tx = load_transactions_frame(client)
+    if limit is not None and limit < len(tx):
+        tx = tx.head(limit)
+
+    con = duckdb.connect()
+    con.register("_tx_df", tx)
+    con.execute(
+        "CREATE TABLE tx AS SELECT * REPLACE (TRY_CAST(date AS TIMESTAMP) AS date) FROM _tx_df"
+    )
+    con.unregister("_tx_df")
+    con.execute("CREATE VIEW emp AS SELECT DISTINCT employee_id, employee_name, department FROM tx")
+    present = {"tx", "emp"}
+
+    flags_df = fetch_table(client, "transaction_flags")
+    if not flags_df.empty:
+        con.register("_f", flags_df)
+        con.execute("CREATE TABLE flags AS SELECT * FROM _f")
+        con.unregister("_f")
+        present.add("flags")
+
+    strikes_df = fetch_table(client, "employee_strikes")
+    if not strikes_df.empty:
+        con.register("_s", strikes_df)
+        con.execute("CREATE TABLE strikes AS SELECT * FROM _s")
+        con.unregister("_s")
+        present.add("strikes")
+
+    budgets_df = fetch_table(client, "budgets")
+    if not budgets_df.empty:
+        dept_df = fetch_table(client, "departments")
+        con.register("_b", budgets_df)
+        if not dept_df.empty:
+            con.register("_d", dept_df)
+            con.execute(
+                """CREATE TABLE budget AS
+                SELECT d.department_name AS department, b.budget, b.quarter, b.year
+                FROM _b b LEFT JOIN _d d ON b.department_id = d.id"""
+            )
+            con.unregister("_d")
+        else:
+            con.execute(
+                "CREATE TABLE budget AS SELECT department_id AS department, budget, quarter, year FROM _b"
+            )
+        con.unregister("_b")
+        present.add("budget")
+
+    return con, present
+
+
+def format_history(turns: list[dict]) -> str:
+    lines: list[str] = []
+    for t in turns[-6:]:
+        q = t.get("question", "")
+        s = t.get("summary") or t.get("text") or ""
+        lines.append(f"Q: {q}\nA: {s}")
+    return "\n".join(lines)
+
+
 def schema_doc(present: set[str]) -> str:
     parts = ["tx(id, employee_id, date TIMESTAMP, amount DOUBLE /*CAD*/, merchant_name, "
              "merchant_category /*MCC*/, city, zipcode, latitude, longitude, event_group_id, "

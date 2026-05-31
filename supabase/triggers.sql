@@ -1,0 +1,30 @@
+-- Supabase webhook trigger for new transactions
+-- Requires pg_net extension and a configured webhook URL pointing to POST /api/webhooks/supabase
+--
+-- Example (adjust URL and auth for your deployment):
+-- CREATE EXTENSION IF NOT EXISTS pg_net;
+--
+-- CREATE OR REPLACE FUNCTION notify_new_transaction()
+-- RETURNS trigger AS $$
+-- BEGIN
+--   PERFORM net.http_post(
+--     url := 'http://127.0.0.1:8000/api/webhooks/supabase',
+--     headers := '{"Content-Type": "application/json"}'::jsonb,
+--     body := jsonb_build_object(
+--       'type', TG_OP,
+--       'table', TG_TABLE_NAME,
+--       'record', row_to_json(NEW)
+--     )::text
+--   );
+--   RETURN NEW;
+-- END;
+-- $$ LANGUAGE plpgsql SECURITY DEFINER;
+--
+-- CREATE TRIGGER on_transaction_insert
+--   AFTER INSERT ON transactions
+--   FOR EACH ROW
+--   EXECUTE FUNCTION notify_new_transaction();
+
+-- Note: Supabase Database Webhooks (Dashboard) can also call the same endpoint without SQL.
+-- Payload shape must match WebhookPayload in api/routes/webhooks.py:
+-- { "type": "INSERT", "table": "transactions", "record": { ...transaction row... } }

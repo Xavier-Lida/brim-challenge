@@ -3,7 +3,17 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.deps import cors_origins
-from api.routes import approvals, compliance, flags, reports, transactions
+from api.routes import (
+    approvals,
+    assistant,
+    compliance,
+    flags,
+    notifications,
+    policies,
+    reports,
+    transactions,
+    webhooks,
+)
 
 load_dotenv()
 
@@ -22,6 +32,10 @@ app.include_router(flags.router)
 app.include_router(approvals.router)
 app.include_router(reports.router)
 app.include_router(transactions.router)
+app.include_router(assistant.router)
+app.include_router(policies.router)
+app.include_router(notifications.router)
+app.include_router(webhooks.router)
 
 
 @app.get("/")

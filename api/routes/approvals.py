@@ -12,6 +12,7 @@ from api.deps import supabase_client
 from api.supabase_io import (
     apply_decision_to_supabase,
     list_approvals_enriched,
+    load_active_policy,
     load_all_from_supabase,
     persist_pipeline_to_supabase,
 )
@@ -21,6 +22,15 @@ from feature3 import (
     process_decision,
     send_email_resend,
 )
+
+
+def _policy_threshold(client) -> float:
+    policy = load_active_policy(client)
+    threshold = policy.get("approval_threshold_cad", APPROVAL_THRESHOLD_CAD)
+    try:
+        return float(threshold)
+    except (TypeError, ValueError):
+        return APPROVAL_THRESHOLD_CAD
 
 router = APIRouter(prefix="/api/approvals", tags=["approvals"])
 
@@ -38,23 +48,24 @@ def get_approvals(client=Depends(supabase_client)) -> list[dict[str, Any]]:
 @router.post("/run")
 def run_approvals_pipeline(
     mock_llm: bool = Query(False, alias="mock_llm"),
-    threshold: float = Query(APPROVAL_THRESHOLD_CAD, gt=0),
+    threshold: float | None = Query(None, gt=0),
     send: bool = Query(False),
     client=Depends(supabase_client),
 ) -> dict[str, Any]:
     use_llm = not mock_llm
+    effective_threshold = threshold if threshold is not None else _policy_threshold(client)
     approver_to = os.getenv("APPROVER_EMAIL", "approver@company.com")
     from_addr = os.getenv("RESEND_FROM", "Brim <noreply@company.com>")
 
     df, flags, strikes, budgets = load_all_from_supabase(client)
     try:
         approval_requests, notifications, emails = build_pipeline(
-            df, flags, strikes, budgets, threshold, approver_to, use_llm
+            df, flags, strikes, budgets, effective_threshold, approver_to, use_llm
         )
         mode = "llm" if use_llm else "mock"
     except Exception as exc:  # noqa: BLE001
         approval_requests, notifications, emails = build_pipeline(
-            df, flags, strikes, budgets, threshold, approver_to, use_llm=False
+            df, flags, strikes, budgets, effective_threshold, approver_to, use_llm=False
         )
         mode = f"mock (fallback: {exc})"
 
@@ -94,7 +105,7 @@ def decide_approval(
         flags,
         strikes,
         budgets,
-        APPROVAL_THRESHOLD_CAD,
+        _policy_threshold(client),
         transaction_id,
         decision,
         body.approver_id,
